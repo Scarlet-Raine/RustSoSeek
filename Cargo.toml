@@ -1,0 +1,15 @@
+[package]
+name = "rustsoseek"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.80"
+repository = "https://github.com/Scarlet-Raine/RustSoSeek"
+description = "Clean-room native Soulseek client library (wire protocol, login, search, download)."
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "net"] }
+thiserror = "2"
+tracing = "0.1"
+md-5 = "0.10"
+flate2 = "1"
