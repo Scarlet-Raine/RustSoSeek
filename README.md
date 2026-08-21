@@ -13,8 +13,7 @@ no HTTP API, no external process:
 
 ## Licensing
 
-Licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT) at
-your option.
+Licensed under [Apache-2.0](LICENSE).
 
 This is a **clean-room implementation**: it was written from the public Soulseek
 protocol documentation only (`SLSKPROTOCOL.md`, Museek+ wiki) and contains no
