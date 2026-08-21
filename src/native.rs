@@ -130,6 +130,13 @@ struct Shared {
     /// filenames cancelled by the caller; file connections stop writing and
     /// (when requested) delete the partial file.
     cancelled: std::collections::HashSet<String>,
+    /// Tokens with a file connection currently streaming, so the outbound and
+    /// relayed/inbound `F` paths cannot both write the same partial file.
+    active_transfers: std::collections::HashSet<u32>,
+    /// Peer-rejected downloads (username, filename) not yet observed by the
+    /// embedding application; drained via
+    /// [`NativeClient::take_failed_downloads`].
+    failed_downloads: Vec<(String, String)>,
     /// Search phrases excluded from the search network (server code 160).
     excluded_phrases: Vec<String>,
     /// Our branch position (nth generation) in the distributed network.
@@ -415,6 +422,13 @@ impl NativeClient {
             .collect()
     }
 
+    /// Drain peer-rejected downloads (`UploadFailed`) as `(username, filename)`
+    /// pairs. The filename is reported in the form the peer refused (often
+    /// backslash-separated); consumers should match paths separator-insensitively.
+    pub fn take_failed_downloads(&self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.inner.shared.lock().unwrap().failed_downloads)
+    }
+
     /// Cancel a download by filename, optionally deleting the partial file.
     /// Removes the pending/accepted download and marks it cancelled so any
     /// in-flight `F` connection stops writing.
@@ -543,7 +557,13 @@ fn resolve_peer_address(inner: &Arc<NativeInner>, resp: proto::GetPeerAddressRes
 }
 
 /// Respond to an indirect connection request by connecting to the peer and
-/// sending `PierceFireWall` with the server-provided token.
+/// sending `PierceFireWall` with the server-provided token. The relayed
+/// connection then serves the role named by `resp.conn_type`: peer messages
+/// (`P`) or a file transfer (`F`, where we are the downloader and the uploader
+/// streams after our `FileOffset`). Dispatching on the type matters: parsing
+/// an `F` relay as a `P` connection reads the uploader's bare 4-byte
+/// `FileTransferInit` token as a bogus length prefix and silently strands the
+/// transfer until the uploader gives up.
 fn pierce_firewall(inner: &Arc<NativeInner>, resp: proto::ConnectToPeerResponse) {
     let inner = inner.clone();
     tokio::spawn(async move {
@@ -551,13 +571,52 @@ fn pierce_firewall(inner: &Arc<NativeInner>, resp: proto::ConnectToPeerResponse)
             std::net::IpAddr::V4(std::net::Ipv4Addr::from(resp.ip)),
             resp.port as u16,
         );
-        let Ok(mut stream) = TcpStream::connect(addr).await else {
-            return;
+        let mut stream = match TcpStream::connect(addr).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    username = %resp.username,
+                    conn_type = %resp.conn_type,
+                    token = resp.token,
+                    error = %e,
+                    "soulseek: PierceFireWall connect failed"
+                );
+                return;
+            }
         };
-        let _ = stream
+        if let Err(e) = stream
             .write_all(&PierceFireWall { token: resp.token }.encode())
-            .await;
-        let _ = handle_peer_messages(stream, inner, Some(resp.username.clone())).await;
+            .await
+        {
+            tracing::warn!(
+                username = %resp.username,
+                conn_type = %resp.conn_type,
+                token = resp.token,
+                error = %e,
+                "soulseek: PierceFireWall write failed"
+            );
+            return;
+        }
+        tracing::info!(
+            username = %resp.username,
+            conn_type = %resp.conn_type,
+            token = resp.token,
+            "soulseek: PierceFireWall relay established"
+        );
+        match resp.conn_type.as_str() {
+            conn_type::FILE => {
+                if let Err(e) = handle_file_connection(stream, inner).await {
+                    tracing::warn!(
+                        username = %resp.username,
+                        error = %e,
+                        "soulseek: relayed F connection failed"
+                    );
+                }
+            }
+            _ => {
+                let _ = handle_peer_messages(stream, inner, Some(resp.username.clone())).await;
+            }
+        }
     });
 }
 
@@ -565,6 +624,38 @@ fn next_token() -> u32 {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(1);
     COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Marks a transfer token as actively streaming for its lifetime, so the
+/// outbound `F` path and an inbound/relayed `F` connection cannot both write
+/// the same partial file. Removing the token on drop keeps failed attempts
+/// from blocking later delivery paths.
+struct ActiveGuard {
+    shared: Arc<Mutex<Shared>>,
+    token: u32,
+}
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.shared
+            .lock()
+            .unwrap()
+            .active_transfers
+            .remove(&self.token);
+    }
+}
+
+/// Try to claim exclusive write access for a transfer token.
+fn claim_transfer(shared: &Arc<Mutex<Shared>>, token: u32) -> Option<ActiveGuard> {
+    let mut guard = shared.lock().unwrap();
+    if guard.active_transfers.contains(&token) {
+        return None;
+    }
+    guard.active_transfers.insert(token);
+    Some(ActiveGuard {
+        shared: Arc::clone(shared),
+        token,
+    })
 }
 
 /// Handle a distributed search request: forward the raw message to every child
@@ -878,21 +969,50 @@ async fn handle_peer_messages(
                 // The peer refused our queue request (file not found in their
                 // index, queue/ratio policy, transfer refused). Fail the
                 // matching pending download loudly instead of hanging forever
-                // as "queued".
+                // as "queued", and record the refusal for the embedding
+                // application (drained via `take_failed_downloads`).
                 if let Ok(filename) = crate::wire::Reader::new(&msg.payload).read_string() {
-                    let peer = peer_username.as_deref().unwrap_or("");
-                    let removed = {
+                    let peer = peer_username.as_deref().unwrap_or("").to_string();
+                    let outcome = {
                         let mut shared = inner.shared.lock().unwrap();
                         let before = shared.pending.len();
                         shared
                             .pending
                             .retain(|p| !(p.filename == filename && p.username == peer));
-                        shared.pending.len() != before
+                        // Drop dead accepted entries so they stop reporting
+                        // progress, but never touch one that is actively
+                        // streaming over an `F` connection right now.
+                        let mut streaming_token = None;
+                        let mut dead_tokens = Vec::new();
+                        for (token, d) in shared.downloads.iter() {
+                            if d.username == peer
+                                && normalized_path(&d.filename) == normalized_path(&filename)
+                            {
+                                if shared.active_transfers.contains(token) {
+                                    streaming_token = Some(*token);
+                                } else {
+                                    dead_tokens.push(*token);
+                                }
+                            }
+                        }
+                        for token in dead_tokens {
+                            shared.downloads.remove(&token);
+                        }
+                        // Record the refusal for the embedding application
+                        // (`take_failed_downloads`) unless the file is
+                        // mid-stream from another delivery path.
+                        if streaming_token.is_none() {
+                            shared
+                                .failed_downloads
+                                .push((peer.clone(), filename.clone()));
+                        }
+                        (shared.pending.len() != before, streaming_token.is_some())
                     };
                     tracing::warn!(
                         username = ?peer_username,
                         filename = %filename,
-                        removed,
+                        removed_pending = outcome.0,
+                        was_streaming = outcome.1,
                         "soulseek: peer refused download (UploadFailed)"
                     );
                 }
@@ -1000,17 +1120,24 @@ async fn handle_transfer_request(
             .write_all(&TransferResponse::encode_accept(req.token, expected).encode())
             .await?;
 
-        // Open the `F` connection TO the uploader: modern clients
-        // (slskd/aioslsk/Nicotine+) expect the *downloader* to connect and
-        // stream the file; peers behind NAT can never reach the downloader's
-        // listen socket otherwise. The P connection's peer address is the
-        // uploader's listening socket.
+        // Fallback: also open an `F` connection TO the uploader for peers
+        // that expect the downloader to connect (slskd-style). Most uploaders
+        // dial the downloader (or relay via ConnectToPeer type F) themselves
+        // immediately after the accept, so delay this attempt to give their
+        // delivery a chance to claim the transfer first.
         if req.direction == direction::UPLOAD {
             if let Ok(addr) = stream.peer_addr() {
                 let inner = inner.clone();
                 let token = req.token;
                 tokio::spawn(async move {
-                    let _ = initiate_f_download(inner, addr, token, expected).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                    if let Err(e) = initiate_f_download(inner, addr, token, expected).await {
+                        tracing::debug!(
+                            token,
+                            error = %e,
+                            "soulseek: outbound F fallback ended"
+                        );
+                    }
                 });
             }
         }
@@ -1048,12 +1175,22 @@ async fn initiate_f_download(
         .write_all(&proto::FileTransferInit { token }.encode())
         .await?;
 
+    // Only one delivery path may write this transfer; if the uploader is
+    // already delivering via a relayed/inbound `F` connection, abort quietly.
+    let Some(_active) = claim_transfer(&inner.shared, token) else {
+        tracing::debug!(
+            token,
+            "soulseek: outbound F aborted; transfer already streaming"
+        );
+        return Ok(());
+    };
+
     // Absorb a gratuitous uploader `FileOffset` if one arrives before we send
     // ours (some peers pre-announce it and then wait for our declaration).
     {
         let mut offset_buf = [0u8; 8];
         match tokio::time::timeout(
-            std::time::Duration::from_millis(500),
+            std::time::Duration::from_millis(150),
             stream.read_exact(&mut offset_buf),
         )
         .await
@@ -1066,10 +1203,10 @@ async fn initiate_f_download(
                 );
             }
             Ok(Err(e)) => {
-                tracing::warn!(
+                tracing::debug!(
                     token,
                     error = %e,
-                    "soulseek: F connection failed before FileOffset exchange"
+                    "soulseek: uploader closed outbound F (likely dials the downloader itself)"
                 );
                 return Err(e);
             }
@@ -1172,6 +1309,16 @@ async fn handle_file_connection(
                 return Ok(());
             }
         }
+    };
+
+    // Only one delivery path may write this transfer; the outbound `F`
+    // fallback aborts when we win the claim here.
+    let Some(_active) = claim_transfer(&inner.shared, init.token) else {
+        tracing::debug!(
+            token = init.token,
+            "soulseek: duplicate F delivery for active transfer ignored"
+        );
+        return Ok(());
     };
 
     stream
@@ -1475,6 +1622,104 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    /// Regression test for NAT'd downloaders: an uploader that cannot reach
+    /// our listen socket relays the file connection via
+    /// `ConnectToPeer(conn_type = "F")`. After we `PierceFireWall` to them,
+    /// they speak the file protocol on that same socket: bare 4-byte
+    /// `FileTransferInit` token, our 8-byte `FileOffset`, then the payload.
+    /// Parsing such a relay as a `P` connection strands the transfer.
+    #[tokio::test]
+    async fn pierce_firewall_f_relay_serves_file() {
+        let tmp = std::env::temp_dir().join(format!("rustsoseek-relay-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Stand-in for the remote uploader's listen socket.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uploader_addr = listener.local_addr().unwrap();
+        let uploader = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // The piercing side sends only PierceFireWall (u8 frame).
+            let (c, payload) = read_u8_message(&mut stream).await.unwrap();
+            assert_eq!(c, code::PIERCE_FIREWALL);
+            let mut r = crate::wire::Reader::new(&payload);
+            assert_eq!(r.read_u32().unwrap(), 4242);
+
+            // Uploader speaks F directly: token then read our offset.
+            stream
+                .write_all(&FileTransferInit { token: 7 }.encode())
+                .await
+                .unwrap();
+            let mut off_buf = [0u8; 8];
+            stream.read_exact(&mut off_buf).await.unwrap();
+            assert_eq!(u64::from_le_bytes(off_buf), 0);
+            stream.write_all(b"hello world!").await.unwrap();
+            // The downloader closes on completion.
+            let mut buf = [0u8; 16];
+            while let Ok(n) = stream.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+            }
+        });
+
+        let server = MockServer::spawn("127.0.0.1:1".parse().unwrap()).await;
+        let listen = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_port = listen.local_addr().unwrap().port();
+        drop(listen);
+
+        let client = NativeClient::connect(NativeConfig {
+            server_addr: server.addr.to_string(),
+            username: "me".to_string(),
+            password: "pw".to_string(),
+            listen_port,
+            download_dir: tmp.to_string_lossy().into_owned(),
+            ..NativeConfig::default()
+        })
+        .await
+        .expect("connect");
+
+        // The accepted transfer is already registered under token 7.
+        client.inner.shared.lock().unwrap().downloads.insert(
+            7,
+            Download {
+                username: "alice".to_string(),
+                filename: "music/song.flac".to_string(),
+                size: 12,
+                offset: 0,
+            },
+        );
+
+        let ip = match uploader_addr.ip() {
+            std::net::IpAddr::V4(v4) => u32::from(v4),
+            _ => u32::from(Ipv4Addr::LOCALHOST),
+        };
+        pierce_firewall(
+            &client.inner,
+            proto::ConnectToPeerResponse {
+                username: "alice".to_string(),
+                conn_type: conn_type::FILE.to_string(),
+                ip,
+                port: uploader_addr.port() as u32,
+                token: 4242,
+                privileged: false,
+                obfuscation_type: 0,
+                obfuscated_port: 0,
+            },
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), uploader)
+            .await
+            .expect("uploader did not finish in time")
+            .expect("uploader task failed");
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let written = std::fs::read(tmp.join("song.flac")).expect("file written");
+        assert_eq!(written, b"hello world!");
+
+        server.stop().await;
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[tokio::test]
