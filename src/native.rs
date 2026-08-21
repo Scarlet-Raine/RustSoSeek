@@ -1020,9 +1020,13 @@ async fn handle_transfer_request(
 
 /// Open the file connection to an accepting uploader and stream the file to
 /// disk. Wire order: `PeerInit(F)` (u8 code framing), the 4-byte
-/// `FileTransferInit` token, then read the uploader's 8-byte `FileOffset`
-/// (resume position; 0 for a fresh transfer) before streaming raw file data
-/// until `expected` bytes are read.
+/// `FileTransferInit` token, then the *downloader* sends its 8-byte
+/// `FileOffset` (bytes already downloaded; 0 for a fresh transfer) before raw
+/// file data is streamed. Per the protocol documentation, `FileOffset` is
+/// always sent by the downloader at the start of an `F` connection; a peer
+/// that waits for it would otherwise strand the transfer. Some uploaders send
+/// their own `FileOffset` first and then wait for ours; absorb that with a
+/// short read window so neither variant deadlocks or corrupts the stream.
 async fn initiate_f_download(
     inner: Arc<NativeInner>,
     addr: std::net::SocketAddr,
@@ -1044,9 +1048,39 @@ async fn initiate_f_download(
         .write_all(&proto::FileTransferInit { token }.encode())
         .await?;
 
-    let mut offset_buf = [0u8; 8];
-    stream.read_exact(&mut offset_buf).await?;
-    let offset = u64::from_le_bytes(offset_buf);
+    // Absorb a gratuitous uploader `FileOffset` if one arrives before we send
+    // ours (some peers pre-announce it and then wait for our declaration).
+    {
+        let mut offset_buf = [0u8; 8];
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            stream.read_exact(&mut offset_buf),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {
+                tracing::debug!(
+                    token,
+                    peer_offset = u64::from_le_bytes(offset_buf),
+                    "soulseek: F uploader announced FileOffset before ours"
+                );
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    token,
+                    error = %e,
+                    "soulseek: F connection failed before FileOffset exchange"
+                );
+                return Err(e);
+            }
+            Err(_) => {}
+        }
+    }
+    // v1 has no resume; declare zero unless a partial local file exists.
+    let offset = 0u64;
+    stream
+        .write_all(&proto::FileOffset { offset }.encode())
+        .await?;
 
     let (filename, dest_dir, dest) = {
         let shared = inner.shared.lock().unwrap();
@@ -1284,10 +1318,10 @@ mod tests {
         }
     }
 
-    /// A mock peer that (a) sends a search response to the client's listen
-    /// socket and (b) serves a download: accepts a P connection, sends a
-    /// `TransferRequest`, reads the accept, then streams file data over an F
-    /// connection.
+    /// A mock peer that answers a search, then serves a download: accepts a `P`
+    /// connection, sends a `TransferRequest`, reads the accept, and then serves
+    /// the file data over the `F` connection the *downloader* (client) opens to
+    /// it — the modern transfer direction.
     struct MockPeer {
         listen: SocketAddr,
         shutdown: Option<oneshot::Sender<()>>,
@@ -1297,6 +1331,7 @@ mod tests {
         async fn spawn() -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let listen = listener.local_addr().unwrap();
+            let files: Arc<Mutex<HashMap<u32, Vec<u8>>>> = Arc::default();
             let (tx, rx) = oneshot::channel();
             tokio::spawn(async move {
                 let mut shutdown = rx;
@@ -1304,9 +1339,10 @@ mod tests {
                     tokio::select! {
                         _ = &mut shutdown => return,
                         accepted = listener.accept() => {
-                            let Ok((mut stream, _)) = accepted else { continue };
+                            let Ok((stream, _)) = accepted else { continue };
+                            let files = files.clone();
                             tokio::spawn(async move {
-                                let _ = serve_peer_download(&mut stream).await;
+                                let _ = serve_peer_connection(stream, files).await;
                             });
                         }
                     }
@@ -1366,15 +1402,23 @@ mod tests {
         }
     }
 
-    async fn serve_peer_download(stream: &mut TcpStream) -> Result<(), std::io::Error> {
-        // PeerInit (u8 frame).
-        let (c, payload) = read_u8_message(stream).await?;
+    /// Dispatch an inbound connection by its `PeerInit` type: `P` connections
+    /// serve the queue/transfer-request round trip; `F` connections serve the
+    /// file data once the downloader opens them.
+    async fn serve_peer_connection(
+        mut stream: TcpStream,
+        files: Arc<Mutex<HashMap<u32, Vec<u8>>>>,
+    ) -> Result<(), std::io::Error> {
+        let (c, payload) = read_u8_message(&mut stream).await?;
         assert_eq!(c, code::PEER_INIT);
         let init = PeerInit::decode(&crate::wire::encode_u8_frame(c, &payload)).unwrap();
+        if init.conn_type == conn_type::FILE {
+            return serve_uploader_f(&mut stream, files).await;
+        }
         assert_eq!(init.conn_type, conn_type::PEER);
 
         // QueueUpload (u32 code).
-        let msg = read_message(stream).await?;
+        let msg = read_message(&mut stream).await?;
         assert_eq!(msg.code, code::QUEUE_UPLOAD);
         let mut r = crate::wire::Reader::new(&msg.payload);
         let filename = r.read_string().unwrap();
@@ -1390,12 +1434,46 @@ mod tests {
             .await?;
 
         // TransferResponse (accept).
-        let resp = read_message(stream).await?;
+        let resp = read_message(&mut stream).await?;
         assert_eq!(resp.code, code::TRANSFER_RESPONSE);
         let tr = TransferResponse::decode(&resp).unwrap();
         assert!(tr.allowed);
         assert_eq!(tr.file_size, Some(12));
 
+        files.lock().unwrap().insert(7, b"hello world!".to_vec());
+        Ok(())
+    }
+
+    /// Uploader side of a downloader-initiated `F` connection: read the 4-byte
+    /// `FileTransferInit` token and the downloader's 8-byte `FileOffset`, then
+    /// stream the file payload. The downloader closes once all bytes arrived.
+    async fn serve_uploader_f(
+        stream: &mut TcpStream,
+        files: Arc<Mutex<HashMap<u32, Vec<u8>>>>,
+    ) -> Result<(), std::io::Error> {
+        let mut token_buf = [0u8; 4];
+        stream.read_exact(&mut token_buf).await?;
+        let token = u32::from_le_bytes(token_buf);
+
+        // The downloader declares its resume offset (0 for a fresh transfer).
+        let mut offset_buf = [0u8; 8];
+        stream.read_exact(&mut offset_buf).await?;
+        assert_eq!(u64::from_le_bytes(offset_buf), 0);
+
+        let data = files
+            .lock()
+            .unwrap()
+            .get(&token)
+            .cloned()
+            .unwrap_or_default();
+        stream.write_all(&data).await?;
+        // Keep the connection open; the downloader closes on completion.
+        let mut buf = [0u8; 16];
+        while let Ok(n) = stream.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+        }
         Ok(())
     }
 
@@ -1441,38 +1519,16 @@ mod tests {
         assert_eq!(results[0].size, Some(12));
         assert_eq!(results[0].bitrate, Some(950));
 
-        // Download: queue from the peer, which streams 12 bytes over F.
+        // Download: queue from the peer. The client opens the `F` connection
+        // to the uploader itself and receives the streamed file.
         client
             .download("alice", "music/song.flac", 12)
             .await
             .expect("download");
 
-        // The peer streams file data over an F connection to our listen socket.
-        let mut fstream = TcpStream::connect(connect_addr).await.unwrap();
-        fstream
-            .write_all(
-                &PeerInit {
-                    username: "alice".to_string(),
-                    conn_type: conn_type::FILE.to_string(),
-                    token: 0,
-                }
-                .encode(),
-            )
-            .await
-            .unwrap();
-        // FileTransferInit (token=7) then file data.
-        fstream
-            .write_all(&FileTransferInit { token: 7 }.encode())
-            .await
-            .unwrap();
-        // Read the FileOffset the client sends back.
-        let mut off_buf = [0u8; 8];
-        fstream.read_exact(&mut off_buf).await.unwrap();
-        assert_eq!(u64::from_le_bytes(off_buf), 0);
-        fstream.write_all(b"hello world!").await.unwrap();
-        drop(fstream);
-
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // The client declares its FileOffset then streams 12 bytes over the
+        // downloader-initiated F connection.
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
         let written = std::fs::read(tmp.join("song.flac")).expect("file written");
         assert_eq!(written, b"hello world!");
