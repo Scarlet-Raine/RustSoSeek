@@ -77,23 +77,7 @@ fn decode_search_files(r: &mut Reader<'_>) -> Result<Vec<SearchFileEntry>, WireE
     let count = r.read_u32()? as usize;
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
-        let _code = r.read_u8()?; // always 1
-        let filename = r.read_string()?;
-        let size = r.read_u64()?;
-        let extension = r.read_string()?;
-        let attr_count = r.read_u32()? as usize;
-        let mut attributes = Vec::with_capacity(attr_count);
-        for _ in 0..attr_count {
-            let attr_code = r.read_u32()?;
-            let attr_value = r.read_u32()?;
-            attributes.push((attr_code, attr_value));
-        }
-        out.push(SearchFileEntry {
-            filename,
-            size,
-            extension,
-            attributes,
-        });
+        out.push(decode_single_file(r)?);
     }
     Ok(out)
 }
@@ -382,6 +366,11 @@ impl ExcludedSearchPhrases {
     }
 }
 
+/// Decode an already-decompressed `FileSearchResponse` payload.
+pub fn decode_file_search_response_plain(plain: &[u8]) -> Result<FileSearchResponse, WireError> {
+    decode_file_search_response(plain)
+}
+
 /// Peer-init `PeerInit` message (peer-init code 1, `uint8` code framing).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerInit {
@@ -441,6 +430,299 @@ impl QueueUpload {
     }
 }
 
+/// SharedFoldersFiles(message (server code 35): announce how many folders/files
+/// we share. Sent after login when shares are configured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedFoldersFiles {
+    pub folders: u32,
+    pub files: u32,
+}
+
+impl SharedFoldersFiles {
+    pub fn encode(&self) -> Message {
+        let mut w = Writer::new();
+        w.write_u32(self.folders);
+        w.write_u32(self.files);
+        Message::new(code::SHARED_FOLDERS_FILES, w.into_inner())
+    }
+}
+
+/// Server `GetUserStats` request (server code 36).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GetUserStats {
+    pub username: String,
+}
+
+impl GetUserStats {
+    pub fn encode(&self) -> Message {
+        let mut w = Writer::new();
+        w.write_string(&self.username);
+        Message::new(code::GET_USER_STATS, w.into_inner())
+    }
+}
+
+/// Server `GetUserStats` response (server code 36): aggregate share/transfer
+/// statistics for a user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserStats {
+    pub username: String,
+    pub avg_speed: u32,
+    pub num_downloads: u32,
+    pub num_files: u32,
+    pub num_dirs: u32,
+}
+
+impl UserStats {
+    pub fn decode(msg: &Message) -> Result<Self, WireError> {
+        let mut r = Reader::new(&msg.payload);
+        Ok(Self {
+            username: r.read_string()?,
+            avg_speed: r.read_u32()?,
+            num_downloads: r.read_u32()?,
+            num_files: r.read_u32()?,
+            num_dirs: r.read_u32()?,
+        })
+    }
+
+    /// Encode (used by the in-process mock server in tests).
+    pub fn encode(&self) -> Message {
+        let mut w = Writer::new();
+        w.write_string(&self.username);
+        w.write_u32(self.avg_speed);
+        w.write_u32(self.num_downloads);
+        w.write_u32(self.num_files);
+        w.write_u32(self.num_dirs);
+        Message::new(code::GET_USER_STATS, w.into_inner())
+    }
+}
+
+/// A peer-initiated file search arriving on a `P` connection (peer code 4
+/// with a trailing query string; used for wishlist-style direct searches).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerFileSearch {
+    pub token: u32,
+    pub query: String,
+}
+
+/// Decode a peer code 4 payload. Code 4 is dual-use: token + query = file
+/// search; token-only = browse request. Returns `Ok(None)` when the payload is
+/// token-only (browse) or malformed.
+pub fn decode_peer_search_or_browse(payload: &[u8]) -> Result<Option<PeerFileSearch>, WireError> {
+    let mut r = Reader::new(payload);
+    let token = r.read_u32()?;
+    if r.is_empty() {
+        return Ok(None); // browse request
+    }
+    let query = r.read_string()?;
+    Ok(Some(PeerFileSearch { token, query }))
+}
+
+/// Peer `BrowseRequest` (peer code 4, token-only payload): ask a peer for its
+/// complete shared-folder tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowseRequest {
+    pub token: u32,
+}
+
+impl BrowseRequest {
+    pub fn encode(&self) -> Message {
+        let mut w = Writer::new();
+        w.write_u32(self.token);
+        Message::new(code::PEER_SEARCH_OR_BROWSE, w.into_inner())
+    }
+}
+
+/// One folder inside a `BrowseResponse`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowseFolder {
+    /// Folder path as the peer reports it (share-relative).
+    pub name: String,
+    pub files: Vec<SearchFileEntry>,
+}
+
+/// Decoded peer `BrowseResponse` (peer code 5): a peer's full share tree.
+/// The wire payload is zlib compressed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowseResponse {
+    pub username: String,
+    pub token: u32,
+    pub folders: Vec<BrowseFolder>,
+}
+
+fn decode_folder_files(r: &mut Reader<'_>) -> Result<Vec<SearchFileEntry>, WireError> {
+    let count = r.read_u32()? as usize;
+    let mut files = Vec::with_capacity(count);
+    for _ in 0..count {
+        let entry = decode_single_file(r)?;
+        files.push(entry);
+    }
+    Ok(files)
+}
+
+/// Decode one bare file record (`code` byte, filename, size, extension,
+/// attributes). Used by browse/folder-contents responses.
+fn decode_single_file(r: &mut Reader<'_>) -> Result<SearchFileEntry, WireError> {
+    let _code = r.read_u8()?; // always 1
+    let filename = r.read_string()?;
+    let size = r.read_u64()?;
+    let extension = r.read_string()?;
+    let attr_count = r.read_u32()? as usize;
+    let mut attributes = Vec::with_capacity(attr_count);
+    for _ in 0..attr_count {
+        let attr_code = r.read_u32()?;
+        let attr_value = r.read_u32()?;
+        attributes.push((attr_code, attr_value));
+    }
+    Ok(SearchFileEntry {
+        filename,
+        size,
+        extension,
+        attributes,
+    })
+}
+
+fn encode_single_file(w: &mut Writer, f: &SearchFileEntry) {
+    w.write_u8(1);
+    w.write_string(&f.filename);
+    w.write_u64(f.size);
+    w.write_string(&f.extension);
+    w.write_u32(f.attributes.len() as u32);
+    for (c, v) in &f.attributes {
+        w.write_u32(*c);
+        w.write_u32(*v);
+    }
+}
+
+impl BrowseResponse {
+    pub fn decode(plain: &[u8]) -> Result<Self, WireError> {
+        let mut r = Reader::new(plain);
+        let username = r.read_string()?;
+        let token = r.read_u32()?;
+        let folder_count = r.read_u32()? as usize;
+        let mut folders = Vec::with_capacity(folder_count);
+        for _ in 0..folder_count {
+            let name = r.read_string()?;
+            let files = decode_folder_files(&mut r)?;
+            folders.push(BrowseFolder { name, files });
+        }
+        Ok(Self {
+            username,
+            token,
+            folders,
+        })
+    }
+
+    /// Encode into a zlib-compressed peer message (as responders send it).
+    pub fn encode_message(&self) -> Result<Message, std::io::Error> {
+        let mut plain = Writer::new();
+        plain.write_string(&self.username);
+        plain.write_u32(self.token);
+        plain.write_u32(self.folders.len() as u32);
+        for folder in &self.folders {
+            plain.write_string(&folder.name);
+            plain.write_u32(folder.files.len() as u32);
+            for file in &folder.files {
+                encode_single_file(&mut plain, file);
+            }
+        }
+        let compressed = zlib_compress(&plain.into_inner())?;
+        Ok(Message::new(code::PEER_BROWSE_RESPONSE, compressed))
+    }
+}
+
+/// Peer `FolderContentsRequest` (peer code 36): ask a peer for the contents of
+/// one shared folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderContentsRequest {
+    pub token: u32,
+    /// Folder path as reported by the peer's browse/share listing.
+    pub dir: String,
+}
+
+/// Decoded peer `FolderContentsResponse` (peer code 37). The wire payload is
+/// zlib compressed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderContentsResponse {
+    pub username: String,
+    pub token: u32,
+    pub dir: String,
+    pub files: Vec<SearchFileEntry>,
+}
+
+impl FolderContentsRequest {
+    pub fn encode(&self) -> Message {
+        let mut w = Writer::new();
+        w.write_u32(self.token);
+        w.write_string(&self.dir);
+        Message::new(code::PEER_FOLDER_CONTENTS_REQUEST, w.into_inner())
+    }
+}
+
+impl FolderContentsResponse {
+    pub fn decode(plain: &[u8]) -> Result<Self, WireError> {
+        let mut r = Reader::new(plain);
+        let username = r.read_string()?;
+        let token = r.read_u32()?;
+        let dir = r.read_string()?;
+        let files = decode_folder_files(&mut r)?;
+        Ok(Self {
+            username,
+            token,
+            dir,
+            files,
+        })
+    }
+
+    /// Encode into a zlib-compressed peer message (as responders send it).
+    pub fn encode_message(&self) -> Result<Message, std::io::Error> {
+        let mut plain = Writer::new();
+        plain.write_string(&self.username);
+        plain.write_u32(self.token);
+        plain.write_string(&self.dir);
+        plain.write_u32(self.files.len() as u32);
+        for file in &self.files {
+            encode_single_file(&mut plain, file);
+        }
+        let compressed = zlib_compress(&plain.into_inner())?;
+        Ok(Message::new(
+            code::PEER_FOLDER_CONTENTS_RESPONSE,
+            compressed,
+        ))
+    }
+}
+
+/// Compress a payload with zlib (search/browse responses travel compressed).
+pub(crate) fn zlib_compress(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+    use std::io::Write;
+    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(data)?;
+    enc.finish()
+}
+
+impl FileSearchResponse {
+    /// Encode into a zlib-compressed peer message (as responders send it).
+    /// Mirrors [`decode_file_search_response`] field-for-field.
+    pub fn encode_message(&self) -> Result<Message, std::io::Error> {
+        let write_entries = |w: &mut Writer, files: &[SearchFileEntry]| {
+            w.write_u32(files.len() as u32);
+            for file in files {
+                encode_single_file(w, file);
+            }
+        };
+        let mut plain = Writer::new();
+        plain.write_string(&self.username);
+        plain.write_u32(self.token);
+        write_entries(&mut plain, &self.files);
+        plain.write_bool(self.slot_free);
+        plain.write_u32(self.avg_speed);
+        plain.write_u32(self.queue_length);
+        plain.write_u32(0); // unknown/reserved
+        write_entries(&mut plain, &self.private_files);
+        let compressed = zlib_compress(&plain.into_inner())?;
+        Ok(Message::new(code::FILE_SEARCH_RESPONSE, compressed))
+    }
+}
+
 /// Peer `TransferRequest` message (peer code 40), sent by the uploading peer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferRequest {
@@ -452,6 +734,16 @@ pub struct TransferRequest {
 }
 
 impl TransferRequest {
+    /// Encode an uploader-side request (we are about to upload to a peer).
+    pub fn encode_upload(token: u32, filename: &str, file_size: u64) -> Message {
+        let mut w = Writer::new();
+        w.write_u32(direction::UPLOAD);
+        w.write_u32(token);
+        w.write_string(filename);
+        w.write_u64(file_size);
+        Message::new(code::TRANSFER_REQUEST, w.into_inner())
+    }
+
     pub fn decode(msg: &Message) -> Result<Self, WireError> {
         let mut r = Reader::new(&msg.payload);
         let direction = r.read_u32()?;
@@ -527,6 +819,14 @@ impl PlaceInQueueResponse {
             place: r.read_u32()?,
         })
     }
+
+    /// Encode (used by uploaders reporting queue positions).
+    pub fn encode(&self) -> Message {
+        let mut w = Writer::new();
+        w.write_string(&self.filename);
+        w.write_u32(self.place);
+        Message::new(code::PLACE_IN_QUEUE_RESPONSE, w.into_inner())
+    }
 }
 
 /// Peer `UploadFailed` (peer code 46): filename only.
@@ -540,6 +840,13 @@ impl UploadFailed {
         Ok(Self {
             filename: r.read_string()?,
         })
+    }
+
+    /// Encode a refusal for a requested upload (file not in our share).
+    pub fn encode(filename: &str) -> Message {
+        let mut w = Writer::new();
+        w.write_string(filename);
+        Message::new(code::UPLOAD_FAILED, w.into_inner())
     }
 }
 
@@ -915,5 +1222,136 @@ mod tests {
         }
         .encode();
         assert!(DistribBranchLevel::decode(&framed).is_err());
+    }
+
+    #[test]
+    fn shared_folders_files_encodes_counts() {
+        let msg = SharedFoldersFiles {
+            folders: 3,
+            files: 120,
+        }
+        .encode();
+        assert_eq!(msg.code, code::SHARED_FOLDERS_FILES);
+        let mut r = Reader::new(&msg.payload);
+        assert_eq!(r.read_u32().unwrap(), 3);
+        assert_eq!(r.read_u32().unwrap(), 120);
+    }
+
+    #[test]
+    fn user_stats_roundtrip() {
+        let stats = UserStats {
+            username: "alice".to_string(),
+            avg_speed: 64000,
+            num_downloads: 5,
+            num_files: 1000,
+            num_dirs: 40,
+        };
+        let decoded = UserStats::decode(&stats.encode()).unwrap();
+        assert_eq!(decoded, stats);
+    }
+
+    fn sample_file(name: &str) -> SearchFileEntry {
+        SearchFileEntry {
+            filename: name.to_string(),
+            size: 42,
+            extension: "mp3".to_string(),
+            attributes: vec![(0, 320), (1, 180)],
+        }
+    }
+
+    #[test]
+    fn file_search_response_encode_decode_roundtrip() {
+        let resp = FileSearchResponse {
+            username: "me".to_string(),
+            token: 11,
+            files: vec![sample_file("music/a.mp3"), sample_file("music/b.mp3")],
+            slot_free: true,
+            avg_speed: 900,
+            queue_length: 2,
+            private_files: Vec::new(),
+        };
+        let msg = resp.encode_message().unwrap();
+        let decoded = decode_file_search_response_message(&msg).unwrap();
+        assert_eq!(decoded.username, "me");
+        assert_eq!(decoded.token, 11);
+        assert_eq!(decoded.files.len(), 2);
+        assert_eq!(decoded.files[0].bitrate(), Some(320));
+        assert!(decoded.slot_free);
+        assert_eq!(decoded.queue_length, 2);
+    }
+
+    #[test]
+    fn peer_search_vs_browse_payload_disambiguation() {
+        // Browse request: bare token.
+        let mut w = Writer::new();
+        w.write_u32(77);
+        assert!(decode_peer_search_or_browse(&w.into_inner())
+            .unwrap()
+            .is_none());
+
+        // File search: token + query.
+        let mut w = Writer::new();
+        w.write_u32(88);
+        w.write_string("flac");
+        let s = decode_peer_search_or_browse(&w.into_inner())
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.token, 88);
+        assert_eq!(s.query, "flac");
+    }
+
+    #[test]
+    fn browse_response_roundtrip_through_zlib() {
+        let resp = BrowseResponse {
+            username: "bob".to_string(),
+            token: 9,
+            folders: vec![
+                BrowseFolder {
+                    name: "music".to_string(),
+                    files: vec![sample_file("music/x.mp3")],
+                },
+                BrowseFolder {
+                    name: "docs".to_string(),
+                    files: Vec::new(),
+                },
+            ],
+        };
+        let msg = resp.encode_message().unwrap();
+        let mut decoder = flate2::read::ZlibDecoder::new(&msg.payload[..]);
+        use std::io::Read;
+        let mut plain = Vec::new();
+        decoder.read_to_end(&mut plain).unwrap();
+        let decoded = BrowseResponse::decode(&plain).unwrap();
+        assert_eq!(decoded, resp);
+    }
+
+    #[test]
+    fn folder_contents_roundtrip_through_zlib() {
+        let resp = FolderContentsResponse {
+            username: "carol".to_string(),
+            token: 4,
+            dir: "music/album".to_string(),
+            files: vec![sample_file("music/album/t.mp3")],
+        };
+        let msg = resp.encode_message().unwrap();
+        let mut decoder = flate2::read::ZlibDecoder::new(&msg.payload[..]);
+        use std::io::Read;
+        let mut plain = Vec::new();
+        decoder.read_to_end(&mut plain).unwrap();
+        let decoded = FolderContentsResponse::decode(&plain).unwrap();
+        assert_eq!(decoded, resp);
+    }
+
+    #[test]
+    fn folder_contents_request_encodes_token_then_dir() {
+        let msg = FolderContentsRequest {
+            token: 5,
+            dir: "music/album".to_string(),
+        }
+        .encode();
+        assert_eq!(msg.code, code::PEER_FOLDER_CONTENTS_REQUEST);
+        let mut r = Reader::new(&msg.payload);
+        assert_eq!(r.read_u32().unwrap(), 5);
+        assert_eq!(r.read_string().unwrap(), "music/album");
     }
 }

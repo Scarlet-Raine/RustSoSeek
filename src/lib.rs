@@ -17,7 +17,12 @@ pub mod error;
 pub mod mocknet;
 pub mod native;
 pub mod proto;
+pub mod share;
 pub mod wire;
 
 pub use error::Error;
-pub use native::{DownloadStatus, NativeClient, NativeConfig, SearchResult};
+pub use native::{
+    BrowseResultInfo, DownloadStatus, FolderContentsResult, NativeClient, NativeConfig,
+    SearchResult, SourceFolderView, UploadStatus, UserStatsInfo,
+};
+pub use share::ShareIndex;

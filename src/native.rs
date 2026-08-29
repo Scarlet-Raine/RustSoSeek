@@ -5,9 +5,12 @@
 //! are confined to this crate via [`crate::wire`] and [`crate::proto`].
 
 use crate::proto::{
-    self, FileSearch, FileSearchResponse, FileTransferInit, GetPeerAddress, PeerInit,
+    self, BrowseRequest, BrowseResponse, FileSearch, FileSearchResponse, FileTransferInit,
+    FolderContentsRequest, FolderContentsResponse, GetPeerAddress, GetUserStats, PeerInit,
     PierceFireWall, PlaceInQueueResponse, QueueUpload, TransferRequest, TransferResponse,
+    UserStats,
 };
+use crate::share::{ShareIndex, SharedFileMeta};
 use crate::wire::{self, code, conn_type, direction, Message};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -27,6 +30,13 @@ pub struct NativeConfig {
     pub listen_port: u16,
     /// Directory completed downloads are written to.
     pub download_dir: String,
+    /// Local directories to share with the network. Indexed at connect() and
+    /// via `rescan_shares()`; announced to the server via SharedFoldersFiles.
+    pub shared_dirs: Vec<String>,
+    /// Maximum simultaneous upload slots for peers downloading from us.
+    pub max_upload_slots: usize,
+    /// Maximum simultaneous uploads per single peer.
+    pub max_uploads_per_user: usize,
     /// Reserved major version (agpeer reserves 177, see SOULSEEK_REWRITE.md).
     pub major_version: u32,
     /// Reserved minor version (agpeer reserves 710, see SOULSEEK_REWRITE.md).
@@ -41,6 +51,9 @@ impl Default for NativeConfig {
             password: String::new(),
             listen_port: 2234,
             download_dir: "downloads".to_string(),
+            shared_dirs: Vec::new(),
+            max_upload_slots: 1,
+            max_uploads_per_user: 1,
             major_version: 177,
             minor_version: 710,
         }
@@ -117,6 +130,142 @@ pub struct DownloadStatus {
     pub offset: u64,
 }
 
+/// One file inside a peer's shared tree, as returned by browsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShareFileInfo {
+    pub virtual_path: String,
+    pub size: u64,
+    pub extension: Option<String>,
+    pub bitrate: Option<u32>,
+    pub duration: Option<u32>,
+}
+
+/// One folder inside a peer's shared tree, as returned by browsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShareFolderInfo {
+    /// Folder path as the peer reports it (share-relative).
+    pub name: String,
+    pub files: Vec<ShareFileInfo>,
+}
+
+/// Full browse of a user's shares (`browse_user`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowseResultInfo {
+    pub username: String,
+    pub folders: Vec<ShareFolderInfo>,
+}
+
+/// Contents of a single folder on a peer's share (`folder_contents`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderContentsResult {
+    pub username: String,
+    pub dir: String,
+    pub files: Vec<ShareFileInfo>,
+}
+
+/// The folder that contains a given search result
+/// (`result_source_folder`): all sibling files plus the containing path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceFolderView {
+    pub username: String,
+    /// Containing folder as the peer reports it.
+    pub folder: String,
+    pub files: Vec<ShareFileInfo>,
+}
+
+/// Aggregate statistics about another user (`user_stats`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserStatsInfo {
+    pub username: String,
+    /// Advertised average upload speed in bytes/second.
+    pub avg_speed: u32,
+    pub num_downloads: u32,
+    pub num_files: u32,
+    pub num_dirs: u32,
+}
+
+impl From<UserStats> for UserStatsInfo {
+    fn from(u: UserStats) -> Self {
+        Self {
+            username: u.username,
+            avg_speed: u.avg_speed,
+            num_downloads: u.num_downloads,
+            num_files: u.num_files,
+            num_dirs: u.num_dirs,
+        }
+    }
+}
+
+fn file_info_from_entry(entry: &crate::proto::SearchFileEntry) -> ShareFileInfo {
+    ShareFileInfo {
+        virtual_path: entry.filename.clone(),
+        size: entry.size,
+        extension: if entry.extension.is_empty() {
+            None
+        } else {
+            Some(entry.extension.to_lowercase())
+        },
+        bitrate: entry.bitrate(),
+        duration: entry.duration(),
+    }
+}
+
+impl From<BrowseResponse> for BrowseResultInfo {
+    fn from(b: BrowseResponse) -> Self {
+        Self {
+            username: b.username,
+            folders: b
+                .folders
+                .into_iter()
+                .map(|f| ShareFolderInfo {
+                    name: f.name,
+                    files: f.files.iter().map(file_info_from_entry).collect(),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<FolderContentsResponse> for FolderContentsResult {
+    fn from(f: FolderContentsResponse) -> Self {
+        Self {
+            username: f.username,
+            dir: f.dir,
+            files: f.files.iter().map(file_info_from_entry).collect(),
+        }
+    }
+}
+
+/// An upload we are serving (or have offered and awaiting acceptance).
+#[derive(Debug, Clone)]
+struct Upload {
+    username: String,
+    virtual_path: String,
+    local_path: std::path::PathBuf,
+    size: u64,
+    offset: u64,
+    /// True once the downloader accepted our TransferRequest.
+    accepted: bool,
+    since: std::time::Instant,
+}
+
+/// A queued upload waiting for a free slot.
+#[derive(Debug, Clone)]
+struct PendingUpload {
+    username: String,
+    virtual_path: String,
+}
+
+/// Upload progress snapshot exposed to the backend adapter. Queued (not yet
+/// accepted) uploads report `offset = 0`.
+#[derive(Debug, Clone)]
+pub struct UploadStatus {
+    pub username: String,
+    pub filename: String,
+    pub size: u64,
+    pub offset: u64,
+}
+
 /// Shared state between the client and its background tasks.
 #[derive(Default)]
 struct Shared {
@@ -125,8 +274,9 @@ struct Shared {
     downloads: HashMap<u32, Download>,
     /// downloads queued but awaiting a TransferRequest.
     pending: Vec<PendingDownload>,
-    /// username -> pending address resolution.
-    pending_addr: HashMap<String, oneshot::Sender<SocketAddr>>,
+    /// username -> pending address resolutions (multiple waiters may race for
+    /// the same peer: a download plus several search answers).
+    pending_addr: HashMap<String, Vec<oneshot::Sender<SocketAddr>>>,
     /// filenames cancelled by the caller; file connections stop writing and
     /// (when requested) delete the partial file.
     cancelled: std::collections::HashSet<String>,
@@ -147,6 +297,22 @@ struct Shared {
     parent: Option<SocketAddr>,
     /// Addresses of our distributed children.
     children: Vec<SocketAddr>,
+    /// Index of our own shared files, when `shared_dirs` is configured.
+    share_index: Option<Arc<ShareIndex>>,
+    /// Transfer token -> upload we are serving (awaiting acceptance or
+    /// actively streaming over an `F` connection).
+    uploads: HashMap<u32, Upload>,
+    /// FIFO of peers waiting for a free upload slot.
+    upload_queue: Vec<PendingUpload>,
+    /// Uploads we failed to serve (downloader rejection), drained via
+    /// `take_failed_uploads`.
+    failed_uploads: Vec<(String, String)>,
+    /// username -> pending `GetUserStats` response.
+    pending_stats: HashMap<String, oneshot::Sender<UserStatsInfo>>,
+    /// Browse token -> pending full-share tree.
+    pending_browse: HashMap<u32, oneshot::Sender<BrowseResultInfo>>,
+    /// Folder-contents token -> pending single folder listing.
+    pending_folder: HashMap<u32, oneshot::Sender<FolderContentsResult>>,
 }
 
 /// The native Soulseek client. Cheap to clone (wraps `Arc`s).
@@ -202,12 +368,38 @@ impl NativeClient {
             .await
             .map_err(|e| crate::error::Error::Io(e.to_string()))?;
 
+        // Index the shares up front (synchronous, bounded by local disk) and
+        // announce the totals so other clients' browse/stats views work.
+        let share_index = if config.shared_dirs.is_empty() {
+            None
+        } else {
+            tracing::info!(
+                dirs = config.shared_dirs.len(),
+                "soulseek: indexing shared directories"
+            );
+            Some(Arc::new(ShareIndex::build(&config.shared_dirs)))
+        };
+        if let Some(index) = &share_index {
+            let msg = proto::SharedFoldersFiles {
+                folders: index.roots as u32,
+                files: index.files.len() as u32,
+            }
+            .encode();
+            stream
+                .write_all(&msg.encode())
+                .await
+                .map_err(|e| crate::error::Error::Io(e.to_string()))?;
+        }
+
         let listener = TcpListener::bind(("0.0.0.0", config.listen_port))
             .await
             .map_err(|e| crate::error::Error::Io(e.to_string()))?;
 
         let (read_half, write_half) = stream.into_split();
-        let shared = Arc::new(Mutex::new(Shared::default()));
+        let shared = Arc::new(Mutex::new(Shared {
+            share_index,
+            ..Shared::default()
+        }));
         let server = tokio::sync::Mutex::new(write_half);
         let listener = Arc::new(listener);
 
@@ -279,6 +471,28 @@ impl NativeClient {
                     code::GET_PEER_ADDRESS => {
                         if let Ok(resp) = proto::GetPeerAddressResponse::decode(&msg) {
                             resolve_peer_address(&inner, resp);
+                        }
+                    }
+                    code::GET_USER_STATS => {
+                        if let Ok(stats) = UserStats::decode(&msg) {
+                            resolve_user_stats(&inner, stats);
+                        }
+                    }
+                    code::FILE_SEARCH => {
+                        // The server relays other users' searches to us; we
+                        // answer from our share index over a direct peer
+                        // connection to the searcher.
+                        if let Some(req) = decode_server_file_search(&msg) {
+                            tracing::debug!(
+                                username = %req.username,
+                                token = req.token,
+                                query = %req.query,
+                                "soulseek: server-relayed search received"
+                            );
+                            let inner = inner.clone();
+                            tokio::spawn(async move {
+                                answer_query(&inner, &req.username, req.token, &req.query).await;
+                            });
                         }
                     }
                     code::CONNECT_TO_PEER => {
@@ -443,6 +657,215 @@ impl NativeClient {
         }
     }
 
+    /// Re-index the configured shared directories. Announced counts update on
+    /// the next successful operation that needs them; the server-side totals
+    /// can be refreshed by reconnecting.
+    pub fn rescan_shares(&self) -> Option<(usize, usize)> {
+        let index = ShareIndex::build(&self.inner.config.shared_dirs);
+        let summary = Some((index.roots, index.files.len()));
+        self.inner.shared.lock().unwrap().share_index = Some(Arc::new(index));
+        summary
+    }
+
+    /// Snapshot of our upload progress and queued uploads. Queued entries
+    /// report `offset = 0`; entries disappear once complete or cancelled.
+    pub fn upload_status(&self) -> Vec<UploadStatus> {
+        let mut shared = self.inner.shared.lock().unwrap();
+        sweep_stale_uploads(&mut shared);
+        let mut out: Vec<UploadStatus> = shared
+            .uploads
+            .values()
+            .map(|u| UploadStatus {
+                username: u.username.clone(),
+                filename: u.virtual_path.clone(),
+                size: u.size,
+                offset: u.offset,
+            })
+            .collect();
+        for q in &shared.upload_queue {
+            let size = {
+                match &shared.share_index {
+                    Some(idx) => idx.lookup(&q.virtual_path).map(|f| f.size).unwrap_or(0),
+                    None => 0,
+                }
+            };
+            out.push(UploadStatus {
+                username: q.username.clone(),
+                filename: q.virtual_path.clone(),
+                size,
+                offset: 0,
+            });
+        }
+        out
+    }
+
+    /// Drain downloads we failed to serve (peer rejected our TransferRequest),
+    /// as `(username, filename)` pairs.
+    pub fn take_failed_uploads(&self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.inner.shared.lock().unwrap().failed_uploads)
+    }
+
+    /// Cancel an outgoing upload offer/queued request. Removing an active
+    /// entry also stops any in-flight `F` stream for it.
+    pub fn cancel_upload(&self, username: &str, filename: &str) {
+        let want = normalized_path(filename);
+        let mut shared = self.inner.shared.lock().unwrap();
+        shared
+            .upload_queue
+            .retain(|p| !(p.username == username && normalized_path(&p.virtual_path) == want));
+        shared
+            .uploads
+            .retain(|_, u| !(u.username == username && normalized_path(&u.virtual_path) == want));
+    }
+
+    /// Fetch aggregate statistics about another user (files/dirs shared,
+    /// average speed). Fails after 30 s without a server response.
+    pub async fn user_stats(&self, username: &str) -> Result<UserStatsInfo, crate::error::Error> {
+        let (tx, rx) = oneshot::channel();
+        self.inner
+            .shared
+            .lock()
+            .unwrap()
+            .pending_stats
+            .insert(username.to_string(), tx);
+        let msg = GetUserStats {
+            username: username.to_string(),
+        }
+        .encode();
+        {
+            let mut server = self.inner.server.lock().await;
+            server
+                .write_all(&msg.encode())
+                .await
+                .map_err(|e| crate::error::Error::Io(e.to_string()))?;
+        }
+        match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+            Ok(Ok(info)) => Ok(info),
+            Ok(Err(_)) | Err(_) => Err(crate::error::Error::Unavailable(
+                "user stats response timeout".into(),
+            )),
+        }
+    }
+
+    /// Browse another user's complete share tree over a direct peer
+    /// connection. Fails after 60 s without a response; large shares may take
+    /// tens of seconds to transfer and decode.
+    pub async fn browse_user(
+        &self,
+        username: &str,
+    ) -> Result<BrowseResultInfo, crate::error::Error> {
+        let token = next_token();
+        let (tx, rx) = oneshot::channel();
+        self.inner
+            .shared
+            .lock()
+            .unwrap()
+            .pending_browse
+            .insert(token, tx);
+
+        let inner = self.inner.clone();
+        let user = username.to_string();
+        // The browse response usually arrives on this same socket; keep it
+        // alive by handing it to the peer message loop, which resolves the
+        // pending registry entry keyed by token.
+        if let Err(e) = async {
+            let mut stream = connect_peer(&inner, &user).await?;
+            stream
+                .write_all(&BrowseRequest { token }.encode().encode())
+                .await?;
+            tokio::spawn(async move {
+                let _ = handle_peer_messages(stream, inner, Some(user)).await;
+            });
+            Ok::<(), std::io::Error>(())
+        }
+        .await
+        {
+            self.inner
+                .shared
+                .lock()
+                .unwrap()
+                .pending_browse
+                .remove(&token);
+            return Err(crate::error::Error::Io(e.to_string()));
+        }
+        match tokio::time::timeout(std::time::Duration::from_secs(60), rx).await {
+            Ok(Ok(tree)) => Ok(tree),
+            _ => Err(crate::error::Error::Unavailable("browse timeout".into())),
+        }
+    }
+
+    /// Request the contents of one folder from a peer's share. Fails after
+    /// 30 s without a response.
+    pub async fn folder_contents(
+        &self,
+        username: &str,
+        dir: &str,
+    ) -> Result<FolderContentsResult, crate::error::Error> {
+        let token = next_token();
+        let (tx, rx) = oneshot::channel();
+        self.inner
+            .shared
+            .lock()
+            .unwrap()
+            .pending_folder
+            .insert(token, tx);
+
+        let inner = self.inner.clone();
+        let user = username.to_string();
+        let dir = dir.to_string();
+        if let Err(e) = async {
+            let mut stream = connect_peer(&inner, &user).await?;
+            stream
+                .write_all(&FolderContentsRequest { token, dir }.encode().encode())
+                .await?;
+            tokio::spawn(async move {
+                let _ = handle_peer_messages(stream, inner, Some(user)).await;
+            });
+            Ok::<(), std::io::Error>(())
+        }
+        .await
+        {
+            self.inner
+                .shared
+                .lock()
+                .unwrap()
+                .pending_folder
+                .remove(&token);
+            return Err(crate::error::Error::Io(e.to_string()));
+        }
+        match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+            Ok(Ok(folder)) => Ok(folder),
+            _ => Err(crate::error::Error::Unavailable(
+                "folder contents timeout".into(),
+            )),
+        }
+    }
+
+    /// Given one search result, browse its source peer and return the whole
+    /// folder containing that file (siblings included).
+    pub async fn result_source_folder(
+        &self,
+        result: &SearchResult,
+    ) -> Result<SourceFolderView, crate::error::Error> {
+        let tree = self.browse_user(&result.username).await?;
+        let target = normalized_path(&result.filename);
+        for folder in &tree.folders {
+            for file in &folder.files {
+                if normalized_path(&file.virtual_path) == target {
+                    return Ok(SourceFolderView {
+                        username: tree.username.clone(),
+                        folder: folder.name.clone(),
+                        files: folder.files.clone(),
+                    });
+                }
+            }
+        }
+        Err(crate::error::Error::Invalid(format!(
+            "result not found while browsing {}'s shares",
+            result.username
+        )))
+    }
+
     /// Queue a download from a peer for a search result. Resolves the peer
     /// address via the server, opens a `P` connection, and sends `QueueUpload`.
     /// The matching `TransferRequest` is handled by the peer-message loop, and
@@ -453,81 +876,105 @@ impl NativeClient {
         filename: &str,
         size: u64,
     ) -> Result<(), crate::error::Error> {
-        let pending = PendingDownload {
-            username: username.to_string(),
-            // Normalize to Soulseek's wire-path form (forward slashes) for the
-            // queue request and the pending match. Search responses often carry
-            // backslash paths from Windows peers, but those peers index their
-            // shares with forward slashes; queueing the backslash form makes
-            // them answer `UploadFailed` instantly. The raw search filename
-            // stays in the adapter's metadata for display.
-            filename: filename.replace('\\', "/"),
-            size,
-        };
+        let wire_filename = filename.replace('\\', "/");
         self.inner
             .shared
             .lock()
             .unwrap()
             .pending
-            .push(pending.clone());
-
-        let (addr_tx, addr_rx) = oneshot::channel();
-        self.inner
-            .shared
-            .lock()
-            .unwrap()
-            .pending_addr
-            .insert(username.to_string(), addr_tx);
-
-        {
-            let msg = GetPeerAddress {
+            .push(PendingDownload {
                 username: username.to_string(),
-            }
-            .encode();
-            let mut server = self.inner.server.lock().await;
-            server
-                .write_all(&msg.encode())
-                .await
-                .map_err(|e| crate::error::Error::Io(e.to_string()))?;
-        }
+                filename: wire_filename.clone(),
+                size,
+            });
 
-        // Bound the address-resolution wait so a silent server cannot leak the
-        // task or the pending/pending_addr entries forever.
-        let peer_addr = tokio::time::timeout(std::time::Duration::from_secs(30), addr_rx)
+        let inner = self.inner.clone();
+        let user = username.to_string();
+        let mut stream = connect_peer(&inner, &user)
             .await
-            .map_err(|_| crate::error::Error::Unavailable("peer address timeout".into()))?
-            .map_err(|_| crate::error::Error::Unavailable("no peer address".into()))?;
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::NotFound => {
+                    crate::error::Error::Unavailable(e.to_string())
+                }
+                _ => crate::error::Error::Io(e.to_string()),
+            })?;
 
-        let mut peer = TcpStream::connect(peer_addr)
+        stream
+            .write_all(
+                &QueueUpload {
+                    filename: wire_filename,
+                }
+                .encode()
+                .encode(),
+            )
             .await
             .map_err(|e| crate::error::Error::Io(e.to_string()))?;
-        peer.write_all(
+
+        tokio::spawn(async move {
+            let _ = handle_peer_messages(stream, inner, Some(user)).await;
+        });
+
+        Ok(())
+    }
+}
+
+/// Resolve a peer address through the server and open a `P` connection
+/// introducing ourselves. Multiple concurrent waiters for the same peer share
+/// one `GetPeerAddress` round trip each (the server answers each request).
+async fn connect_peer(
+    inner: &Arc<NativeInner>,
+    username: &str,
+) -> Result<TcpStream, std::io::Error> {
+    let (tx, rx) = oneshot::channel();
+    {
+        let mut shared = inner.shared.lock().unwrap();
+        shared
+            .pending_addr
+            .entry(username.to_string())
+            .or_default()
+            .push(tx);
+        // Bounded growth: cap waiters per peer so a runaway caller cannot leak
+        // channels waiting on a silent server.
+        if let Some(waiters) = shared.pending_addr.get_mut(username) {
+            while waiters.len() > 32 {
+                waiters.remove(0);
+            }
+        }
+    }
+    {
+        let msg = GetPeerAddress {
+            username: username.to_string(),
+        }
+        .encode();
+        let mut server = inner.server.lock().await;
+        server.write_all(&msg.encode()).await?;
+    }
+    let addr = match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+        Ok(Ok(addr)) => addr,
+        _ => {
+            // Release whatever was registered under us.
+            let mut shared = inner.shared.lock().unwrap();
+            if let Some(v) = shared.pending_addr.get_mut(username) {
+                v.retain(|_| false);
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "peer address unavailable",
+            ));
+        }
+    };
+    let mut stream = TcpStream::connect(addr).await?;
+    stream
+        .write_all(
             &PeerInit {
-                username: self.inner.config.username.clone(),
+                username: inner.config.username.clone(),
                 conn_type: conn_type::PEER.to_string(),
                 token: 0,
             }
             .encode(),
         )
-        .await
-        .map_err(|e| crate::error::Error::Io(e.to_string()))?;
-        peer.write_all(
-            &QueueUpload {
-                filename: filename.to_string(),
-            }
-            .encode()
-            .encode(),
-        )
-        .await
-        .map_err(|e| crate::error::Error::Io(e.to_string()))?;
-
-        let inner = self.inner.clone();
-        tokio::spawn(async move {
-            let _ = handle_peer_messages(peer, inner, Some(pending.username)).await;
-        });
-
-        Ok(())
-    }
+        .await?;
+    Ok(stream)
 }
 
 /// Delete a partial download file (basename only) from the download dir.
@@ -539,21 +986,513 @@ fn remove_partial_file(download_dir: &str, filename: &str) {
     let _ = std::fs::remove_file(path);
 }
 
-/// Resolve a `GetPeerAddress` response into the pending oneshot channel.
+/// Resolve a `GetPeerAddress` response into every pending oneshot channel
+/// registered for that username.
 fn resolve_peer_address(inner: &Arc<NativeInner>, resp: proto::GetPeerAddressResponse) {
     let addr = SocketAddr::new(
         std::net::IpAddr::V4(std::net::Ipv4Addr::from(resp.ip)),
         resp.port as u16,
     );
-    let tx = inner
+    let waiters = inner
         .shared
         .lock()
         .unwrap()
         .pending_addr
-        .remove(&resp.username);
-    if let Some(tx) = tx {
+        .remove(&resp.username)
+        .unwrap_or_default();
+    for tx in waiters {
         let _ = tx.send(addr);
     }
+}
+
+/// A server-relayed search addressed to us (server code 26 payload).
+struct ServerFileSearch {
+    username: String,
+    token: u32,
+    query: String,
+}
+
+fn decode_server_file_search(msg: &Message) -> Option<ServerFileSearch> {
+    let mut r = crate::wire::Reader::new(&msg.payload);
+    Some(ServerFileSearch {
+        username: r.read_string().ok()?,
+        token: r.read_u32().ok()?,
+        query: r.read_string().ok()?,
+    })
+}
+
+/// Map an indexed file into the wire form search/browse responses carry.
+fn response_entry(meta: &SharedFileMeta) -> crate::proto::SearchFileEntry {
+    crate::proto::SearchFileEntry {
+        filename: meta.virtual_path.clone(),
+        size: meta.size,
+        extension: meta.extension.clone(),
+        attributes: meta.attributes.clone(),
+    }
+}
+
+/// Whether a fresh upload offer fits within the configured slot policy.
+fn upload_slot_available(
+    shared: &Shared,
+    config_max_slots: usize,
+    config_max_per_user: usize,
+    username: &str,
+) -> bool {
+    let active = shared.uploads.values().filter(|u| u.accepted).count();
+    let mine = shared
+        .uploads
+        .values()
+        .filter(|u| u.accepted && u.username == username)
+        .count();
+    active < config_max_slots && mine < config_max_per_user
+}
+
+/// Drop uploads that were never accepted (or whose transfer stalled long ago),
+/// freeing their slots. Refreshed on every progress write for accepted ones.
+fn sweep_stale_uploads(shared: &mut Shared) {
+    const CUTOFF: std::time::Duration = std::time::Duration::from_secs(300);
+    let dropped: Vec<(String, String)> = shared
+        .uploads
+        .iter()
+        .filter(|(_, u)| u.since.elapsed() >= CUTOFF)
+        .map(|(_, u)| (u.username.clone(), u.virtual_path.clone()))
+        .collect();
+    shared.uploads.retain(|_, u| u.since.elapsed() < CUTOFF);
+    for (username, vpath) in dropped {
+        tracing::warn!(
+            username = %username,
+            filename = %vpath,
+            "soulseek: upload stalled/expired without acceptance"
+        );
+    }
+}
+
+/// Best-effort start queued uploads now that a slot may be free. Each claim is
+/// served over a fresh `P` connection dialed to the queued peer.
+fn try_promote_uploads(inner: &Arc<NativeInner>) {
+    // (username, virtual_path, size, token)
+    let claims: Vec<(String, String, u64, u32)> = {
+        let mut shared = inner.shared.lock().unwrap();
+        sweep_stale_uploads(&mut shared);
+        let mut out = Vec::new();
+        while let Some(head) = shared.upload_queue.first().cloned() {
+            if shared.uploads.values().filter(|u| u.accepted).count()
+                >= inner.config.max_upload_slots
+            {
+                break;
+            }
+            let mine = shared
+                .uploads
+                .values()
+                .filter(|u| u.accepted && u.username == head.username)
+                .count();
+            if mine >= inner.config.max_uploads_per_user {
+                // This user is at their cap; stop scanning behind them.
+                break;
+            }
+            shared.upload_queue.remove(0);
+            let Some(f) = shared
+                .share_index
+                .as_ref()
+                .and_then(|i| i.lookup(&head.virtual_path))
+            else {
+                continue; // vanished in a rescan; drop silently
+            };
+            let entry = (f.virtual_path.clone(), f.size, f.local_path.clone());
+            let (vpath, size, local_path) = entry;
+            let token = next_token();
+            shared.uploads.insert(
+                token,
+                Upload {
+                    username: head.username.clone(),
+                    virtual_path: vpath.clone(),
+                    local_path,
+                    size,
+                    offset: 0,
+                    accepted: false,
+                    since: std::time::Instant::now(),
+                },
+            );
+            out.push((head.username, vpath, size, token));
+        }
+        out
+    };
+
+    for (username, vpath, size, token) in claims {
+        let inner = inner.clone();
+        tokio::spawn(async move {
+            match connect_peer(&inner, &username).await {
+                Ok(mut stream) => {
+                    let req = TransferRequest::encode_upload(token, &vpath, size);
+                    match stream.write_all(&req.encode()).await {
+                        Ok(()) => {
+                            tracing::info!(
+                                username = %username,
+                                filename = %vpath,
+                                "soulseek: promoted queued upload"
+                            );
+                            tokio::spawn(async move {
+                                let _ = handle_peer_messages(stream, inner, Some(username)).await;
+                            });
+                        }
+                        Err(e) => {
+                            inner.shared.lock().unwrap().uploads.remove(&token);
+                            tracing::warn!(error = %e, "soulseek: promotion TransferRequest failed");
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Peer unreachable: return them to the queue front and
+                    // stop promoting further this round.
+                    let mut shared = inner.shared.lock().unwrap();
+                    shared.uploads.remove(&token);
+                    shared.upload_queue.insert(
+                        0,
+                        PendingUpload {
+                            username,
+                            virtual_path: vpath,
+                        },
+                    );
+                    tracing::warn!(error = %e, "soulseek: promotion connect failed; requeued");
+                }
+            }
+        });
+    }
+}
+
+/// Resolve a pending `user_stats` call from a server response.
+fn resolve_user_stats(inner: &Arc<NativeInner>, stats: UserStats) {
+    let info = UserStatsInfo::from(stats);
+    let tx = inner
+        .shared
+        .lock()
+        .unwrap()
+        .pending_stats
+        .remove(&info.username);
+    if let Some(tx) = tx {
+        let _ = tx.send(info);
+    }
+}
+
+/// Decompress a zlib-framed peer payload (search/browse/folder responses).
+fn decompress_payload(payload: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+    use std::io::Read;
+    let mut decoder = flate2::read::ZlibDecoder::new(payload);
+    let mut plain = Vec::new();
+    decoder.read_to_end(&mut plain)?;
+    Ok(plain)
+}
+
+/// Build a FileSearchResponse from our share index for one query, or `None`
+/// when nothing matches (responders stay silent for empty result sets).
+async fn answer_query(inner: &Arc<NativeInner>, searcher: &str, token: u32, query: &str) {
+    let response = {
+        let shared = inner.shared.lock().unwrap();
+        let Some(index) = &shared.share_index else {
+            return;
+        };
+        let matches = index.find_matches(query, &shared.excluded_phrases, 100);
+        if matches.is_empty() {
+            return;
+        }
+        let active = shared.uploads.values().filter(|u| u.accepted).count();
+        FileSearchResponse {
+            username: inner.config.username.clone(),
+            token,
+            files: matches.iter().map(response_entry).collect(),
+            slot_free: active < inner.config.max_upload_slots,
+            avg_speed: 0,
+            queue_length: shared.upload_queue.len() as u32,
+            private_files: Vec::new(),
+        }
+    };
+    tracing::info!(
+        username = %searcher,
+        token,
+        files = response.files.len(),
+        "soulseek: answering search from shares"
+    );
+    match connect_peer(inner, searcher).await {
+        Ok(stream) => {
+            let msg = match response.encode_message() {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!(error = %e, "soulseek: search response encode failed");
+                    return;
+                }
+            };
+            let inner = inner.clone();
+            let searcher = searcher.to_string();
+            tokio::spawn(async move {
+                let mut stream = stream;
+                if stream.write_all(&msg.encode()).await.is_ok() {
+                    // Keep serving this socket for a follow-up QueueUpload
+                    // arriving over the same connection.
+                    let _ = handle_peer_messages(stream, inner, Some(searcher)).await;
+                }
+            });
+        }
+        Err(e) => {
+            tracing::warn!(username = %searcher, error = %e, "soulseek: failed to dial searcher");
+        }
+    }
+}
+
+enum QueueAction {
+    /// Not in our share: refuse.
+    Fail,
+    /// No slot available: enqueue and report position.
+    Queue(u32),
+    /// Slot available: offer with this token.
+    Offer {
+        token: u32,
+        vpath: String,
+        size: u64,
+    },
+}
+
+/// Handle an inbound `QueueUpload` from a peer on an established `P`
+/// connection: refuse, enqueue with a position report, or offer immediately.
+async fn handle_queue_upload(
+    stream: &mut TcpStream,
+    inner: &Arc<NativeInner>,
+    requested: String,
+    peer_username: Option<&str>,
+) -> Result<(), std::io::Error> {
+    let Some(user) = peer_username else {
+        return Ok(());
+    };
+    let action = {
+        let mut shared = inner.shared.lock().unwrap();
+        sweep_stale_uploads(&mut shared);
+        let found = shared
+            .share_index
+            .as_ref()
+            .and_then(|i| i.lookup(&requested))
+            .map(|f| (f.virtual_path.clone(), f.size));
+        match found {
+            None => QueueAction::Fail,
+            Some((vpath, size)) => {
+                if upload_slot_available(
+                    &shared,
+                    inner.config.max_upload_slots,
+                    inner.config.max_uploads_per_user,
+                    user,
+                ) {
+                    // Re-lookup to grab local path within the same lock.
+                    let local_path = shared
+                        .share_index
+                        .as_ref()
+                        .and_then(|i| i.lookup(&vpath))
+                        .map(|f| f.local_path.clone())
+                        .unwrap_or_default();
+                    let token = next_token();
+                    shared.uploads.insert(
+                        token,
+                        Upload {
+                            username: user.to_string(),
+                            virtual_path: vpath.clone(),
+                            local_path,
+                            size,
+                            offset: 0,
+                            accepted: false,
+                            since: std::time::Instant::now(),
+                        },
+                    );
+                    QueueAction::Offer { token, vpath, size }
+                } else {
+                    shared.upload_queue.push(PendingUpload {
+                        username: user.to_string(),
+                        virtual_path: vpath.clone(),
+                    });
+                    tracing::debug!(
+                        username = %user,
+                        filename = %vpath,
+                        place = shared.upload_queue.len(),
+                        "soulseek: upload queued"
+                    );
+                    QueueAction::Queue(shared.upload_queue.len() as u32)
+                }
+            }
+        }
+    };
+    match action {
+        QueueAction::Fail => {
+            stream
+                .write_all(&proto::UploadFailed::encode(&requested).encode())
+                .await?;
+        }
+        QueueAction::Queue(place) => {
+            // Echo the requested form; peers match on it separator-insensitively.
+            stream
+                .write_all(
+                    &PlaceInQueueResponse {
+                        filename: requested.clone(),
+                        place,
+                    }
+                    .encode()
+                    .encode(),
+                )
+                .await?;
+        }
+        QueueAction::Offer { token, vpath, size } => {
+            let req = TransferRequest::encode_upload(token, &vpath, size).encode();
+            if let Err(e) = stream.write_all(&req).await {
+                // Requester is gone before we could even offer; release slot.
+                inner.shared.lock().unwrap().uploads.remove(&token);
+                return Err(e);
+            }
+            tracing::info!(
+                username = %user,
+                filename = %vpath,
+                size,
+                "soulseek: offered upload"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Process the downloader's acceptance/rejection of our TransferRequest.
+fn handle_transfer_response_upload(inner: &Arc<NativeInner>, tr: TransferResponse) {
+    if tr.allowed {
+        let mut shared = inner.shared.lock().unwrap();
+        if let Some(u) = shared.uploads.get_mut(&tr.token) {
+            u.accepted = true;
+            u.since = std::time::Instant::now();
+            tracing::info!(
+                username = %u.username,
+                filename = %u.virtual_path,
+                "soulseek: downloader accepted upload; awaiting F connection"
+            );
+        }
+        return;
+    }
+    let removed = inner.shared.lock().unwrap().uploads.remove(&tr.token);
+    if let Some(u) = removed {
+        let entry = (u.username.clone(), u.virtual_path.clone());
+        inner.shared.lock().unwrap().failed_uploads.push(entry);
+        tracing::info!(
+            filename = %u.virtual_path,
+            reason = ?tr.reason,
+            "soulseek: downloader rejected our transfer offer"
+        );
+    }
+    try_promote_uploads(inner);
+}
+
+/// Answer an inbound direct search (peer code 4 carrying a query) on the same
+/// connection it arrived on.
+async fn handle_peer_file_search(
+    stream: &mut TcpStream,
+    inner: &Arc<NativeInner>,
+    search: proto::PeerFileSearch,
+) -> Result<(), std::io::Error> {
+    let response = {
+        let shared = inner.shared.lock().unwrap();
+        let Some(index) = &shared.share_index else {
+            return Ok(());
+        };
+        let matches = index.find_matches(&search.query, &shared.excluded_phrases, 100);
+        if matches.is_empty() {
+            return Ok(());
+        }
+        let active = shared.uploads.values().filter(|u| u.accepted).count();
+        FileSearchResponse {
+            username: inner.config.username.clone(),
+            token: search.token,
+            files: matches.iter().map(response_entry).collect(),
+            slot_free: active < inner.config.max_upload_slots,
+            avg_speed: 0,
+            queue_length: shared.upload_queue.len() as u32,
+            private_files: Vec::new(),
+        }
+    };
+    let msg = response.encode_message()?;
+    stream.write_all(&msg.encode()).await
+}
+
+/// Answer a browse request (peer code 4, token-only payload) with our complete
+/// share tree grouped by folder, zlib-compressed, on the same socket.
+async fn handle_browse_request(
+    stream: &mut TcpStream,
+    inner: &Arc<NativeInner>,
+    payload: &[u8],
+) -> Result<(), std::io::Error> {
+    let mut r = crate::wire::Reader::new(payload);
+    let token = r.read_u32().map_err(wire::into_io)?;
+    let folders: Vec<(String, Vec<crate::proto::SearchFileEntry>)> = {
+        let shared = inner.shared.lock().unwrap();
+        match &shared.share_index {
+            None => Vec::new(),
+            Some(index) => {
+                use std::collections::BTreeMap;
+                let mut groups: BTreeMap<String, Vec<crate::proto::SearchFileEntry>> =
+                    BTreeMap::new();
+                for f in &index.files {
+                    let dir = match f.virtual_path.rfind('/') {
+                        Some(i) => f.virtual_path[..i].to_string(),
+                        None => String::new(),
+                    };
+                    groups.entry(dir).or_default().push(response_entry(f));
+                }
+                groups.into_iter().collect()
+            }
+        }
+    };
+    let resp = BrowseResponse {
+        username: inner.config.username.clone(),
+        token,
+        folders: folders
+            .into_iter()
+            .map(|(name, files)| crate::proto::BrowseFolder { name, files })
+            .collect(),
+    };
+    let msg = resp.encode_message()?;
+    tracing::info!(
+        token,
+        folders = resp.folders.len(),
+        "soulseek: answering browse request"
+    );
+    stream.write_all(&msg.encode()).await
+}
+
+/// Answer a `FolderContentsRequest` (peer code 36) for one directory.
+async fn handle_folder_request(
+    stream: &mut TcpStream,
+    inner: &Arc<NativeInner>,
+    payload: &[u8],
+) -> Result<(), std::io::Error> {
+    let mut r = crate::wire::Reader::new(payload);
+    let token = r.read_u32().map_err(wire::into_io)?;
+    let dir = r.read_string().map_err(wire::into_io)?;
+    let want_dir = normalized_path(&dir).to_lowercase();
+    let files: Vec<crate::proto::SearchFileEntry> = {
+        let shared = inner.shared.lock().unwrap();
+        match &shared.share_index {
+            Some(index) => index
+                .files
+                .iter()
+                .filter(|f| {
+                    let parent = match normalized_path(&f.virtual_path).rfind('/') {
+                        Some(i) => normalized_path(&f.virtual_path)[..i].to_lowercase(),
+                        None => String::new(),
+                    };
+                    parent == want_dir
+                })
+                .map(response_entry)
+                .collect(),
+            None => Vec::new(),
+        }
+    };
+    let resp = FolderContentsResponse {
+        username: inner.config.username.clone(),
+        token,
+        dir,
+        files,
+    };
+    let msg = resp.encode_message()?;
+    stream.write_all(&msg.encode()).await
 }
 
 /// Respond to an indirect connection request by connecting to the peer and
@@ -659,19 +1598,25 @@ fn claim_transfer(shared: &Arc<Mutex<Shared>>, token: u32) -> Option<ActiveGuard
 }
 
 /// Handle a distributed search request: forward the raw message to every child
-/// peer over a fresh `D` connection.
+/// peer over a fresh `D` connection, and answer it from our own share index.
 ///
 /// A distributed search that loops back to a token we initiated is already
-/// tracked in `shared.searches`. agpeer v1 shares no files, so we never
-/// generate a `FileSearchResponse` in response to a distributed search; we
-/// only relay it deeper into the network.
+/// tracked in `shared.searches`; we never respond to our own searches.
 fn handle_distributed_search(inner: &Arc<NativeInner>, search: proto::DistribSearch) {
-    let _loopback = inner
+    let is_own = inner
         .shared
         .lock()
         .unwrap()
         .searches
         .contains_key(&search.token);
+
+    if !is_own && search.username != inner.config.username {
+        let inner = inner.clone();
+        let (user, token, query) = (search.username.clone(), search.token, search.query.clone());
+        tokio::spawn(async move {
+            answer_query(&inner, &user, token, &query).await;
+        });
+    }
 
     let children = inner.shared.lock().unwrap().children.clone();
     let inner = inner.clone();
@@ -907,7 +1852,7 @@ async fn handle_incoming(
     );
 
     match init.conn_type.as_str() {
-        conn_type::PEER => handle_peer_messages(stream, inner, None).await,
+        conn_type::PEER => handle_peer_messages(stream, inner, Some(init.username)).await,
         conn_type::FILE => handle_file_connection(stream, inner).await,
         conn_type::DISTRIBUTED => handle_distributed_connection(stream, inner).await,
         _ => Ok(()),
@@ -964,6 +1909,63 @@ async fn handle_peer_messages(
             }
             code::PLACE_IN_QUEUE_RESPONSE => {
                 let _ = PlaceInQueueResponse::decode(&msg);
+            }
+            code::QUEUE_UPLOAD => {
+                if let Ok(filename) = crate::wire::Reader::new(&msg.payload).read_string() {
+                    handle_queue_upload(&mut stream, &inner, filename, peer_username.as_deref())
+                        .await?;
+                }
+            }
+            code::TRANSFER_RESPONSE => {
+                // As the uploader we sent a TransferRequest and receive this.
+                // (The downloader side sends TransferResponse; it never parses
+                // one on its own connection.)
+                if let Ok(tr) = TransferResponse::decode(&msg) {
+                    handle_transfer_response_upload(&inner, tr);
+                }
+            }
+            code::PEER_SEARCH_OR_BROWSE => {
+                match proto::decode_peer_search_or_browse(&msg.payload) {
+                    Ok(Some(search)) => {
+                        handle_peer_file_search(&mut stream, &inner, search).await?;
+                    }
+                    Ok(None) => handle_browse_request(&mut stream, &inner, &msg.payload).await?,
+                    Err(_) => {}
+                }
+            }
+            code::PEER_BROWSE_RESPONSE => {
+                if let Ok(plain) = decompress_payload(&msg.payload) {
+                    if let Ok(resp) = BrowseResponse::decode(&plain) {
+                        let token = resp.token;
+                        let info = BrowseResultInfo::from(resp);
+                        let tx = inner.shared.lock().unwrap().pending_browse.remove(&token);
+                        if let Some(tx) = tx {
+                            tracing::info!(
+                                username = %info.username,
+                                folders = info.folders.len(),
+                                "soulseek: browse response received"
+                            );
+                            let _ = tx.send(info);
+                        } else {
+                            tracing::debug!(token, "soulseek: browse response for unknown token");
+                        }
+                    }
+                }
+            }
+            code::PEER_FOLDER_CONTENTS_REQUEST => {
+                handle_folder_request(&mut stream, &inner, &msg.payload).await?;
+            }
+            code::PEER_FOLDER_CONTENTS_RESPONSE => {
+                if let Ok(plain) = decompress_payload(&msg.payload) {
+                    if let Ok(resp) = FolderContentsResponse::decode(&plain) {
+                        let token = resp.token;
+                        let info = FolderContentsResult::from(resp);
+                        let tx = inner.shared.lock().unwrap().pending_folder.remove(&token);
+                        if let Some(tx) = tx {
+                            let _ = tx.send(info);
+                        }
+                    }
+                }
             }
             code::UPLOAD_FAILED => {
                 // The peer refused our queue request (file not found in their
@@ -1283,6 +2285,9 @@ async fn initiate_f_download(
     Ok(())
 }
 
+/// Dispatch an `F` connection by transfer token: token in `downloads` means we
+/// are receiving (existing behavior); otherwise it must be an upload we are
+/// serving. The 4-byte `FileTransferInit` is read here for both modes.
 async fn handle_file_connection(
     mut stream: TcpStream,
     inner: Arc<NativeInner>,
@@ -1292,9 +2297,146 @@ async fn handle_file_connection(
     let init = FileTransferInit::decode(&token_buf).map_err(wire::into_io)?;
     tracing::info!(token = init.token, "soulseek: F connection opened");
 
+    let is_download = {
+        inner
+            .shared
+            .lock()
+            .unwrap()
+            .downloads
+            .contains_key(&init.token)
+    };
+    if is_download {
+        serve_download_f(stream, inner, init.token).await
+    } else {
+        serve_upload_f(stream, inner, init.token).await
+    }
+}
+
+/// Uploader side of an `F` connection: read the downloader's 8-byte resume
+/// offset, then stream our local file from that offset until complete,
+/// cancelled, or EOF. Completing or cancelling frees a slot and promotes the
+/// next queued upload.
+async fn serve_upload_f(
+    mut stream: TcpStream,
+    inner: Arc<NativeInner>,
+    token: u32,
+) -> Result<(), std::io::Error> {
+    let mut offset_buf = [0u8; 8];
+    stream.read_exact(&mut offset_buf).await?;
+    let dl_offset = u64::from_le_bytes(offset_buf);
+
+    let upload = {
+        let shared = inner.shared.lock().unwrap();
+        shared.uploads.get(&token).cloned()
+    };
+    let Some(upload) = upload else {
+        tracing::warn!(
+            token,
+            "soulseek: F connection for unknown/expired upload token"
+        );
+        return Ok(());
+    };
+
+    let Some(local_path) = upload.local_path.to_str().map(|s| s.to_string()) else {
+        return Ok(());
+    };
+    let mut file = match tokio::fs::File::open(&local_path).await {
+        Ok(f) => f,
+        Err(e) => {
+            // File vanished since indexing: fail this offer and free slot.
+            inner.shared.lock().unwrap().uploads.remove(&token);
+            try_promote_uploads(&inner);
+            tracing::warn!(
+                token,
+                filename = %upload.virtual_path,
+                error = %e,
+                "soulseek: shared file unavailable; upload dropped"
+            );
+            return Ok(());
+        }
+    };
+    let size = upload.size;
+    if size > 0 && dl_offset >= size {
+        // Nothing left to send; treat as complete.
+        finish_upload(&inner, token);
+        return Ok(());
+    }
+    if dl_offset > 0 {
+        file.seek(std::io::SeekFrom::Start(dl_offset)).await?;
+    }
+    tracing::info!(
+        token,
+        username = %upload.username,
+        filename = %upload.virtual_path,
+        offset = dl_offset,
+        "soulseek: streaming upload"
+    );
+
+    let mut sent = dl_offset;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        // A removed entry means cancellation.
+        if !inner.shared.lock().unwrap().uploads.contains_key(&token) {
+            break;
+        }
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        stream.write_all(&buf[..n]).await?;
+        sent += n as u64;
+        {
+            let mut shared = inner.shared.lock().unwrap();
+            if let Some(u) = shared.uploads.get_mut(&token) {
+                u.offset = sent;
+                u.since = std::time::Instant::now();
+            }
+        }
+        if size > 0 && sent >= size {
+            break;
+        }
+    }
+    stream.flush().await?;
+
+    let complete = size > 0 && sent >= size;
+    tracing::info!(
+        filename = %upload.virtual_path,
+        bytes = sent,
+        expected = size,
+        complete,
+        "soulseek: upload F connection closed"
+    );
+    if complete {
+        finish_upload(&inner, token);
+    } else {
+        // Incomplete: leave the entry so the downloader may reconnect with an
+        // offset; the stale sweep frees the slot if they never come back.
+    }
+    Ok(())
+}
+
+/// Mark one upload finished: free its slot and promote queued uploads.
+fn finish_upload(inner: &Arc<NativeInner>, token: u32) {
+    let removed = inner.shared.lock().unwrap().uploads.remove(&token);
+    if let Some(u) = removed {
+        tracing::info!(
+            username = %u.username,
+            filename = %u.virtual_path,
+            "soulseek: upload complete"
+        );
+    }
+    try_promote_uploads(inner);
+}
+
+/// Downloader side of an `F` connection (we are receiving the file).
+async fn serve_download_f(
+    mut stream: TcpStream,
+    inner: Arc<NativeInner>,
+    token: u32,
+) -> Result<(), std::io::Error> {
     let (filename, expected_size, offset) = {
         let shared = inner.shared.lock().unwrap();
-        match shared.downloads.get(&init.token) {
+        match shared.downloads.get(&token) {
             Some(d) => {
                 if shared.cancelled.contains(&d.filename) {
                     return Ok(());
@@ -1303,7 +2445,7 @@ async fn handle_file_connection(
             }
             None => {
                 tracing::warn!(
-                    token = init.token,
+                    token = token,
                     "soulseek: F connection for unknown transfer token"
                 );
                 return Ok(());
@@ -1313,9 +2455,9 @@ async fn handle_file_connection(
 
     // Only one delivery path may write this transfer; the outbound `F`
     // fallback aborts when we win the claim here.
-    let Some(_active) = claim_transfer(&inner.shared, init.token) else {
+    let Some(_active) = claim_transfer(&inner.shared, token) else {
         tracing::debug!(
-            token = init.token,
+            token = token,
             "soulseek: duplicate F delivery for active transfer ignored"
         );
         return Ok(());
@@ -1357,7 +2499,7 @@ async fn handle_file_connection(
         };
         out.write_all(&buf[..n]).await?;
         total += n as u64;
-        if let Some(dl) = inner.shared.lock().unwrap().downloads.get_mut(&init.token) {
+        if let Some(dl) = inner.shared.lock().unwrap().downloads.get_mut(&token) {
             dl.offset = total;
         }
         // Stop once the advertised size is reached (the downloader is
@@ -1442,6 +2584,7 @@ mod tests {
             };
             match msg.code {
                 code::FILE_SEARCH | code::SET_LISTEN_PORT => {}
+                code::SHARED_FOLDERS_FILES => {}
                 code::GET_PEER_ADDRESS => {
                     let mut r = crate::wire::Reader::new(&msg.payload);
                     let username = r.read_string().unwrap();
@@ -1457,6 +2600,25 @@ mod tests {
                     w.write_u16(0); // obfuscated port
                     stream
                         .write_all(&Message::new(code::GET_PEER_ADDRESS, w.into_inner()).encode())
+                        .await?;
+                }
+                code::GET_USER_STATS => {
+                    let username = {
+                        let mut r = crate::wire::Reader::new(&msg.payload);
+                        r.read_string().unwrap()
+                    };
+                    stream
+                        .write_all(
+                            &UserStats {
+                                username,
+                                avg_speed: 12345,
+                                num_downloads: 3,
+                                num_files: 42,
+                                num_dirs: 7,
+                            }
+                            .encode()
+                            .encode(),
+                        )
                         .await?;
                 }
                 code::SERVER_PING => {}
@@ -1941,6 +3103,456 @@ mod tests {
             .await
             .expect("child did not receive the search in time")
             .expect("child task failed");
+
+        server.stop().await;
+    }
+
+    // ------------------------------------------------------------------
+    // Sharing-core integration tests (uploads, queues, browse, stats).
+    // ------------------------------------------------------------------
+
+    /// Create a temp share tree whose top directory is `Music`; returns the
+    /// share root and the peer-visible virtual path of one file.
+    fn make_share(tag: &str) -> (std::path::PathBuf, String) {
+        let base = std::env::temp_dir().join(format!("rss-{}-{}", tag, std::process::id()));
+        std::fs::create_dir_all(base.join("Music").join("MusicStore")).unwrap();
+        std::fs::write(
+            base.join("Music").join("MusicStore").join("song.txt"),
+            b"hello data!",
+        )
+        .unwrap();
+        (base.join("Music"), "Music/MusicStore/song.txt".to_string())
+    }
+
+    fn client_config(server: &SocketAddr, root: &std::path::Path, port: u16) -> NativeConfig {
+        NativeConfig {
+            server_addr: server.to_string(),
+            username: "me".to_string(),
+            password: "pw".to_string(),
+            listen_port: port,
+            download_dir: std::env::temp_dir().to_string_lossy().into_owned(),
+            shared_dirs: vec![root.to_string_lossy().into_owned()],
+            ..NativeConfig::default()
+        }
+    }
+
+    async fn free_listen_port() -> u16 {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    }
+
+    #[tokio::test]
+    async fn upload_round_trip_via_queue_transfer_f() {
+        let (root, _vpath) = make_share("up");
+        let server = MockServer::spawn("127.0.0.1:1".parse().unwrap()).await;
+        let listen_port = free_listen_port().await;
+        let client = NativeClient::connect(client_config(&server.addr, &root, listen_port))
+            .await
+            .expect("connect");
+
+        // A raw downloader: queue the file, accept the offer, then dial `F`
+        // and pull the bytes.
+        let downloader = tokio::spawn(async move {
+            let mut s = TcpStream::connect(SocketAddr::new(
+                std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
+                listen_port,
+            ))
+            .await
+            .unwrap();
+            s.write_all(
+                &PeerInit {
+                    username: "downloader".to_string(),
+                    conn_type: conn_type::PEER.to_string(),
+                    token: 0,
+                }
+                .encode(),
+            )
+            .await
+            .unwrap();
+            s.write_all(
+                &QueueUpload {
+                    filename: "Music/MusicStore/song.txt".to_string(),
+                }
+                .encode()
+                .encode(),
+            )
+            .await
+            .unwrap();
+
+            // Expect TransferRequest(direction=UPLOAD).
+            let msg = read_message(&mut s).await.unwrap();
+            assert_eq!(msg.code, code::TRANSFER_REQUEST);
+            let req = TransferRequest::decode(&msg).unwrap();
+            assert_eq!(req.direction, direction::UPLOAD);
+            assert_eq!(req.file_size, Some(11));
+
+            // Accept.
+            s.write_all(
+                &TransferResponse::encode_accept(req.token, req.file_size.unwrap()).encode(),
+            )
+            .await
+            .unwrap();
+
+            // Dial the F connection with the same token.
+            let mut f = TcpStream::connect(SocketAddr::new(
+                std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
+                listen_port,
+            ))
+            .await
+            .unwrap();
+            f.write_all(
+                &PeerInit {
+                    username: "downloader".to_string(),
+                    conn_type: conn_type::FILE.to_string(),
+                    token: 0,
+                }
+                .encode(),
+            )
+            .await
+            .unwrap();
+            f.write_all(&FileTransferInit { token: req.token }.encode())
+                .await
+                .unwrap();
+            f.write_all(&0u64.to_le_bytes()).await.unwrap(); // FileOffset
+
+            let mut got = Vec::new();
+            f.read_to_end(&mut got).await.unwrap();
+            assert_eq!(got, b"hello data!");
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), downloader)
+            .await
+            .expect("downloader did not finish in time")
+            .expect("downloader task failed");
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            client.upload_status().is_empty(),
+            "upload entry should be released after completion"
+        );
+        assert!(client.take_failed_uploads().is_empty());
+
+        server.stop().await;
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn upload_unknown_path_gets_upload_failed() {
+        let (root, _vpath) = make_share("upfail");
+        let server = MockServer::spawn("127.0.0.1:1".parse().unwrap()).await;
+        let listen_port = free_listen_port().await;
+        let _client = NativeClient::connect(client_config(&server.addr, &root, listen_port))
+            .await
+            .expect("connect");
+
+        let mut s = TcpStream::connect(SocketAddr::new(
+            std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
+            listen_port,
+        ))
+        .await
+        .unwrap();
+        s.write_all(
+            &PeerInit {
+                username: "downloader".to_string(),
+                conn_type: conn_type::PEER.to_string(),
+                token: 0,
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+        s.write_all(
+            &QueueUpload {
+                filename: "MusicStore/missing.txt".to_string(),
+            }
+            .encode()
+            .encode(),
+        )
+        .await
+        .unwrap();
+
+        let msg = read_message(&mut s).await.unwrap();
+        assert_eq!(msg.code, code::UPLOAD_FAILED);
+
+        server.stop().await;
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn second_requester_is_queued_with_position() {
+        let (root, _vpath) = make_share("queue");
+        let server = MockServer::spawn("127.0.0.1:1".parse().unwrap()).await;
+        let listen_port = free_listen_port().await;
+        let client = NativeClient::connect(client_config(&server.addr, &root, listen_port))
+            .await
+            .expect("connect");
+        assert_eq!(client.listen_addr().port(), listen_port);
+
+        let addr = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), listen_port);
+
+        // First requester: queue, get offer, accept — then hold the slot by
+        // never opening an F connection.
+        let mut first = TcpStream::connect(addr).await.unwrap();
+        first
+            .write_all(
+                &PeerInit {
+                    username: "d1".to_string(),
+                    conn_type: conn_type::PEER.to_string(),
+                    token: 0,
+                }
+                .encode(),
+            )
+            .await
+            .unwrap();
+        first
+            .write_all(
+                &QueueUpload {
+                    filename: "Music/MusicStore/song.txt".to_string(),
+                }
+                .encode()
+                .encode(),
+            )
+            .await
+            .unwrap();
+        let msg = read_message(&mut first).await.unwrap();
+        assert_eq!(msg.code, code::TRANSFER_REQUEST);
+        let req = TransferRequest::decode(&msg).unwrap();
+        first
+            .write_all(&TransferResponse::encode_accept(req.token, req.file_size.unwrap()).encode())
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        // Second requester exceeds max_upload_slots=1 -> place in queue 1.
+        let mut second = TcpStream::connect(addr).await.unwrap();
+        second
+            .write_all(
+                &PeerInit {
+                    username: "d2".to_string(),
+                    conn_type: conn_type::PEER.to_string(),
+                    token: 0,
+                }
+                .encode(),
+            )
+            .await
+            .unwrap();
+        second
+            .write_all(
+                &QueueUpload {
+                    filename: "Music/MusicStore/song.txt".to_string(),
+                }
+                .encode()
+                .encode(),
+            )
+            .await
+            .unwrap();
+        let msg = read_message(&mut second).await.unwrap();
+        assert_eq!(msg.code, code::PLACE_IN_QUEUE_RESPONSE);
+        let pq = PlaceInQueueResponse::decode(&msg).unwrap();
+        assert_eq!(pq.place, 1);
+
+        // Queue is visible via upload_status with offset 0.
+        let statuses = client.upload_status();
+        assert!(statuses.iter().any(|s| s.offset == 0 && s.size == 11));
+
+        server.stop().await;
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn incoming_distributed_search_answered_from_shares() {
+        let (root, vpath) = make_share("distrib");
+
+        // The searcher listens for our dialed P connection and the response.
+        let search_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let searcher_addr = search_listener.local_addr().unwrap();
+        let searcher = tokio::spawn(async move {
+            let (mut stream, _) = search_listener.accept().await.unwrap();
+            let (c, payload) = read_u8_message(&mut stream).await.unwrap();
+            assert_eq!(c, code::PEER_INIT);
+            let init = PeerInit::decode(&crate::wire::encode_u8_frame(c, &payload)).unwrap();
+            assert_eq!(init.conn_type, conn_type::PEER);
+            let msg = read_message(&mut stream).await.unwrap();
+            assert_eq!(msg.code, code::FILE_SEARCH_RESPONSE);
+            let mut decoder = flate2::read::ZlibDecoder::new(&msg.payload[..]);
+            use std::io::Read;
+            let mut plain = Vec::new();
+            decoder.read_to_end(&mut plain).unwrap();
+            let resp = proto::decode_file_search_response_plain(&plain).unwrap();
+            assert_eq!(resp.username, "me");
+            assert_eq!(resp.files.len(), 1);
+            assert_eq!(
+                normalized_path(&resp.files[0].filename),
+                normalized_path(&vpath)
+            );
+        });
+
+        let server = MockServer::spawn(searcher_addr).await;
+        let listen_port = free_listen_port().await;
+        let client = NativeClient::connect(client_config(&server.addr, &root, listen_port))
+            .await
+            .expect("connect");
+
+        handle_distributed_search(
+            &client.inner,
+            proto::DistribSearch {
+                identifier: 49,
+                username: "searcher".to_string(),
+                token: 1234,
+                query: "song".to_string(),
+            },
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), searcher)
+            .await
+            .expect("searcher did not finish in time")
+            .expect("searcher task failed");
+
+        server.stop().await;
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn user_stats_resolves_from_server() {
+        let server = MockServer::spawn("127.0.0.1:1".parse().unwrap()).await;
+        let listen_port = free_listen_port().await;
+        let tmp = std::env::temp_dir();
+        let client = NativeClient::connect(NativeConfig {
+            server_addr: server.addr.to_string(),
+            username: "me".to_string(),
+            password: "pw".to_string(),
+            listen_port,
+            download_dir: tmp.to_string_lossy().into_owned(),
+            ..NativeConfig::default()
+        })
+        .await
+        .expect("connect");
+
+        let info = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.user_stats("alice"),
+        )
+        .await
+        .expect("stats timed out")
+        .expect("stats failed");
+        assert_eq!(info.username, "alice");
+        assert_eq!(info.avg_speed, 12345);
+        assert_eq!(info.num_files, 42);
+        assert_eq!(info.num_dirs, 7);
+
+        server.stop().await;
+    }
+
+    /// A mock peer that answers browse (code 4 token-only) and folder-content
+    /// (code 36) requests over a single P connection.
+    async fn serve_browsing_peer(mut stream: TcpStream) {
+        loop {
+            let msg = match read_message(&mut stream).await {
+                Ok(m) => m,
+                Err(_) => return,
+            };
+            match msg.code {
+                code::PEER_SEARCH_OR_BROWSE => {
+                    let mut r = crate::wire::Reader::new(&msg.payload);
+                    let token = r.read_u32().unwrap();
+                    if !r.is_empty() {
+                        continue; // a real file-search request; not under test here
+                    }
+                    let resp = BrowseResponse {
+                        username: "me".to_string(),
+                        token,
+                        folders: vec![proto::BrowseFolder {
+                            name: "music".to_string(),
+                            files: vec![proto::SearchFileEntry {
+                                filename: "music/song.flac".to_string(),
+                                size: 30_000_000,
+                                extension: "flac".to_string(),
+                                attributes: vec![(0, 950), (1, 240)],
+                            }],
+                        }],
+                    };
+                    stream
+                        .write_all(&resp.encode_message().unwrap().encode())
+                        .await
+                        .unwrap();
+                }
+                code::PEER_FOLDER_CONTENTS_REQUEST => {
+                    let mut r = crate::wire::Reader::new(&msg.payload);
+                    let token = r.read_u32().unwrap();
+                    let dir = r.read_string().unwrap();
+                    let resp = FolderContentsResponse {
+                        username: "me".to_string(),
+                        token,
+                        dir: dir.clone(),
+                        files: vec![proto::SearchFileEntry {
+                            filename: format!("{dir}/t.mp3"),
+                            size: 100,
+                            extension: "mp3".to_string(),
+                            attributes: vec![],
+                        }],
+                    };
+                    stream
+                        .write_all(&resp.encode_message().unwrap().encode())
+                        .await
+                        .unwrap();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn browse_user_and_folder_contents_roundtrip() {
+        // Browsing peer on a listener.
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = peer_listener.accept().await {
+                tokio::spawn(serve_browsing_peer(s));
+            }
+        });
+
+        let server = MockServer::spawn(peer_addr).await;
+        let listen_port = free_listen_port().await;
+        let tmp = std::env::temp_dir();
+        let client = NativeClient::connect(NativeConfig {
+            server_addr: server.addr.to_string(),
+            username: "me".to_string(),
+            password: "pw".to_string(),
+            listen_port,
+            download_dir: tmp.to_string_lossy().into_owned(),
+            ..NativeConfig::default()
+        })
+        .await
+        .expect("connect");
+
+        let tree = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.browse_user("peer"),
+        )
+        .await
+        .expect("browse timed out")
+        .expect("browse failed");
+        assert_eq!(tree.username, "me");
+        assert_eq!(tree.folders.len(), 1);
+        assert_eq!(tree.folders[0].name, "music");
+        assert_eq!(tree.folders[0].files[0].virtual_path, "music/song.flac");
+        assert_eq!(tree.folders[0].files[0].bitrate, Some(950));
+        assert_eq!(tree.folders[0].files[0].duration, Some(240));
+
+        let folder = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.folder_contents("peer", "music/album"),
+        )
+        .await
+        .expect("folder timed out")
+        .expect("folder failed");
+        assert_eq!(folder.dir, "music/album");
+        assert_eq!(folder.files.len(), 1);
+        assert_eq!(folder.files[0].virtual_path, "music/album/t.mp3");
 
         server.stop().await;
     }

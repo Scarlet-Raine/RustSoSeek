@@ -39,6 +39,9 @@ pub mod code {
     pub const GET_PEER_ADDRESS: u32 = 3;
     pub const CONNECT_TO_PEER: u32 = 18;
     pub const FILE_SEARCH: u32 = 26;
+    pub const SHARED_FOLDERS_FILES: u32 = 35;
+    pub const GET_USER_STATS: u32 = 36;
+    pub const USER_SEARCH: u32 = 42;
     pub const SERVER_PING: u32 = 32;
     pub const HAVE_NO_PARENT: u32 = 71;
     pub const PARENT_MIN_SPEED: u32 = 83;
@@ -64,6 +67,14 @@ pub mod code {
     pub const PLACE_IN_QUEUE_RESPONSE: u32 = 44;
     pub const UPLOAD_FAILED: u32 = 46;
     pub const UPLOAD_DENIED: u32 = 50;
+
+    // Peer messages (uint32 code) — direct peer search/browse and folder
+    // contents. Code 4 is dual-use per the protocol doc: with a trailing
+    // query string it is a file-search request; token-only it is a browse.
+    pub const PEER_SEARCH_OR_BROWSE: u32 = 4;
+    pub const PEER_BROWSE_RESPONSE: u32 = 5;
+    pub const PEER_FOLDER_CONTENTS_REQUEST: u32 = 36;
+    pub const PEER_FOLDER_CONTENTS_RESPONSE: u32 = 37;
 
     // Distributed messages (uint8 code).
     pub const DISTRIB_SEARCH: u8 = 3;

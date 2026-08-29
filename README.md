@@ -16,10 +16,18 @@ What it does today:
   (see [How downloads work](#how-downloads-work))
 - **Distributed search plumbing** — parent/child `D` connections and search
   relaying
+- **Sharing (uploads)** — configure `shared_dirs`, get indexed once
+  (with clean-room FLAC/MP3 metadata extraction), answer server and
+  distributed searches, serve downloads over a slot/FIFO upload queue
+  (`upload_status`, `cancel_upload`, `take_failed_uploads`)
+- **Browsing** — look up any user's stats (`user_stats`), their full share
+  tree (`browse_user`), or one folder's contents (`folder_contents`); turn a
+  single search result into its whole source folder with
+  `result_source_folder`
 
-What it deliberately does **not** do (v1): shares/uploads, chat rooms, private
-messaging, and the "Rotated" (type 1) obfuscation cipher (only obfuscation
-type 0, matching Nicotine+).
+What it deliberately does **not** do (v1): chat rooms, private messaging,
+wishlist/recommendations, resume support, and the "Rotated" (type 1)
+obfuscation cipher (only obfuscation type 0, matching Nicotine+).
 
 ## Licensing
 
@@ -35,7 +43,7 @@ contains no code translated or copied from `slskd` (AGPL-3.0),
 ```toml
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-rustsoseek = { git = "https://github.com/Scarlet-Raine/RustSoSeek", tag = "v0.1.2" }
+rustsoseek = { git = "https://github.com/Scarlet-Raine/RustSoSeek", tag = "v0.2.0" }
 ```
 
 Requires Rust 1.88+ (tokio MSRV baseline for this workspace).
@@ -123,6 +131,9 @@ the connection — closing is always the downloader's job.
 | `password` | `String` | — | account password |
 | `listen_port` | `u16` | `2234` | local TCP port for inbound peer connections (search responses, direct file delivery) |
 | `download_dir` | `String` | `downloads` | where completed files are written |
+| `shared_dirs` | `Vec<String>` | `[]` | local directories shared with the network; indexed at connect and by `rescan_shares()` |
+| `max_upload_slots` | `usize` | `1` | simultaneous uploads to peers |
+| `max_uploads_per_user` | `usize` | `1` | per-peer cap on concurrent accepted uploads |
 | `major_version` | `u32` | `177` | reserved — see below |
 | `minor_version` | `u32` | `710` | reserved — see below |
 
@@ -148,6 +159,18 @@ pub async fn download(&self, username: &str, filename: &str, size: u64) -> Resul
 pub fn download_status(&self) -> Vec<DownloadStatus>
 pub fn take_failed_downloads(&self) -> Vec<(String, String)>
 pub fn cancel(&self, filename: &str, delete_data: bool)
+
+// --- sharing (uploads) ---
+pub fn rescan_shares(&self) -> Option<(usize, usize)>   // (roots, files), Some when shares configured
+pub fn upload_status(&self) -> Vec<UploadStatus>        // active + queued uploads
+pub fn take_failed_uploads(&self) -> Vec<(String, String)>
+pub fn cancel_upload(&self, username: &str, filename: &str)
+
+// --- browsing users / folders ---
+pub async fn user_stats(&self, username: &str) -> Result<UserStatsInfo>
+pub async fn browse_user(&self, username: &str) -> Result<BrowseResultInfo>
+pub async fn folder_contents(&self, username: &str, dir: &str) -> Result<FolderContentsResult>
+pub async fn result_source_folder(&self, result: &SearchResult) -> Result<SourceFolderView>
 
 // --- introspection ---
 pub fn listen_addr(&self) -> SocketAddr      // your advertised peer address
@@ -255,6 +278,32 @@ Failure modes surface honestly:
 
 Downloads require no port forwarding: relayed delivery covers firewalled
 hosts for the download direction.
+
+## How sharing works
+
+When `shared_dirs` is non-empty the client indexes every file once at
+connect and announces folder/file totals (`SharedFoldersFiles`). Virtual
+paths shown to peers are forward-slash paths rooted at each shared
+directory's own name — sharing `D:\music` exposes `music/artist/song.flac`.
+
+- **Searches** arrive via server relays (code 26) and distributed children;
+  matches are substring/term-based, filtered by `excluded_phrases()`, capped
+  at 100 files per response, and sent to the searcher over a direct `P`
+  connection.
+- **Uploads**: `QueueUpload` for a shared path is offered immediately when a
+  slot is free (uploader-side `TransferRequest`), otherwise it enters a FIFO
+  queue answered with `PlaceInQueueResponse`. Offered-but-unaccepted offers
+  expire after 5 minutes; unfinished streams are freed by the same sweep.
+  Completing an upload promotes the next queued peer automatically.
+- **Audio metadata** is extracted by minimal in-house parsers: FLAC
+  `STREAMINFO` (exact duration/bitrate from sample count) and MP3 frame
+  headers (CBR estimate). Files that fail to parse simply share without
+  attributes.
+
+Browsing uses direct peer connections with token correlation:
+`browse_user` returns the full folder tree, `folder_contents` a single
+directory listing, and `result_source_folder` combines one search result
+with `browse_user` to return the containing folder plus all siblings.
 
 ## Logging
 
