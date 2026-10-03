@@ -15,9 +15,30 @@ use crate::wire::{self, code, conn_type, direction, Message};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::{tcp::OwnedReadHalf, tcp::OwnedWriteHalf, TcpListener, TcpStream};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
+
+/// Longest a single server-socket write may take before the connection is
+/// treated as dead. Keeps a half-open server socket from swallowing writes
+/// forever.
+const SERVER_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Caller-side bound for queueing plus flushing one server message. Kept above
+/// [`SERVER_WRITE_TIMEOUT`] so that, when the socket stalls, the writer's own
+/// verdict is what the caller reports.
+const SERVER_SEND_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// Server messages buffered ahead of the socket. A full queue means the socket
+/// stalled, so further fire-and-forget writes are dropped instead of blocking.
+const SERVER_WRITE_QUEUE: usize = 256;
+
+/// Error text used when the server writer task is gone.
+const SERVER_GONE: &str = "soulseek server connection closed";
+
+/// Error text used when a server write exceeded its bound.
+const SERVER_WRITE_STALLED: &str = "timed out writing to soulseek server";
 
 /// Configuration for the native Soulseek client.
 #[derive(Debug, Clone)]
@@ -324,8 +345,68 @@ pub struct NativeClient {
 struct NativeInner {
     config: NativeConfig,
     shared: Arc<Mutex<Shared>>,
-    server: tokio::sync::Mutex<OwnedWriteHalf>,
+    /// Outbound queue for the server socket, drained by the writer task.
+    server_tx: mpsc::Sender<ServerWrite>,
     listener: Arc<TcpListener>,
+}
+
+/// One outbound server-socket message: the encoded bytes, plus a completion
+/// signal for callers that need to know the write actually happened.
+struct ServerWrite {
+    bytes: Vec<u8>,
+    ack: Option<oneshot::Sender<std::io::Result<()>>>,
+}
+
+impl NativeInner {
+    /// Queue a server message without waiting for the write. `Full` means the
+    /// socket stalled; `Closed` means the writer task is gone.
+    fn server_try_send(&self, bytes: Vec<u8>) -> Result<(), mpsc::error::TrySendError<()>> {
+        self.server_tx
+            .try_send(ServerWrite { bytes, ack: None })
+            .map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => mpsc::error::TrySendError::Full(()),
+                mpsc::error::TrySendError::Closed(_) => mpsc::error::TrySendError::Closed(()),
+            })
+    }
+
+    /// Queue a server message and wait, with a hard bound, for it to reach the
+    /// socket. A stalled server connection therefore surfaces as an error
+    /// after [`SERVER_SEND_TIMEOUT`] instead of blocking the caller forever.
+    async fn server_send(&self, bytes: Vec<u8>) -> Result<(), crate::error::Error> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let write = async {
+            self.server_tx
+                .send(ServerWrite {
+                    bytes,
+                    ack: Some(ack_tx),
+                })
+                .await
+                .map_err(|_| crate::error::Error::Unavailable(SERVER_GONE.into()))?;
+            match ack_rx.await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(crate::error::Error::Io(e.to_string())),
+                Err(_) => Err(crate::error::Error::Unavailable(SERVER_GONE.into())),
+            }
+        };
+        match tokio::time::timeout(SERVER_SEND_TIMEOUT, write).await {
+            Ok(result) => result,
+            Err(_) => Err(crate::error::Error::Unavailable(
+                SERVER_WRITE_STALLED.into(),
+            )),
+        }
+    }
+}
+
+/// Map a non-blocking server-send failure into a client error.
+fn server_send_error(e: mpsc::error::TrySendError<()>) -> crate::error::Error {
+    match e {
+        mpsc::error::TrySendError::Full(()) => crate::error::Error::Unavailable(
+            "soulseek server write queue full (socket stalled)".into(),
+        ),
+        mpsc::error::TrySendError::Closed(()) => {
+            crate::error::Error::Unavailable(SERVER_GONE.into())
+        }
+    }
 }
 
 impl NativeClient {
@@ -396,34 +477,36 @@ impl NativeClient {
             .map_err(|e| crate::error::Error::Io(e.to_string()))?;
 
         let (read_half, write_half) = stream.into_split();
+        let (server_tx, server_rx) = mpsc::channel(SERVER_WRITE_QUEUE);
         let shared = Arc::new(Mutex::new(Shared {
             share_index,
             ..Shared::default()
         }));
-        let server = tokio::sync::Mutex::new(write_half);
         let listener = Arc::new(listener);
+
+        // The write half has exactly one owner, the writer task: callers queue
+        // a message instead of racing for the socket, so a stalled write can
+        // never hold up unrelated requests.
+        Self::spawn_server_writer(write_half, server_rx);
 
         let inner = Arc::new(NativeInner {
             config,
             shared: shared.clone(),
-            server,
+            server_tx,
             listener,
         });
         let client = NativeClient { inner };
 
         // Announce our distributed-network posture: we have no parent yet and
         // will accept child nodes.
-        {
-            let mut server = client.inner.server.lock().await;
-            server
-                .write_all(&proto::HaveNoParent { no_parent: true }.encode().encode())
-                .await
-                .map_err(|e| crate::error::Error::Io(e.to_string()))?;
-            server
-                .write_all(&proto::AcceptChildren { accept: true }.encode().encode())
-                .await
-                .map_err(|e| crate::error::Error::Io(e.to_string()))?;
-        }
+        client
+            .inner
+            .server_send(proto::HaveNoParent { no_parent: true }.encode().encode())
+            .await?;
+        client
+            .inner
+            .server_send(proto::AcceptChildren { accept: true }.encode().encode())
+            .await?;
 
         client.spawn_keep_alive();
         client.spawn_server_read(read_half);
@@ -444,15 +527,48 @@ impl NativeClient {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                let mut server = inner.server.lock().await;
-                if server
-                    .write_all(&crate::wire::server_ping().encode())
-                    .await
-                    .is_err()
+                match inner.server_try_send(crate::wire::server_ping().encode()) {
+                    Ok(()) => {}
+                    // Socket stalled: skip this ping rather than queue behind it.
+                    Err(mpsc::error::TrySendError::Full(())) => {
+                        tracing::warn!("soulseek: server write queue full; ping skipped");
+                    }
+                    Err(mpsc::error::TrySendError::Closed(())) => break,
+                }
+            }
+        });
+    }
+
+    /// Owns the server socket's write half and drains the outbound queue. Each
+    /// write is bounded by [`SERVER_WRITE_TIMEOUT`]; a socket that cannot
+    /// accept a message is abandoned, so the connection fails fast instead of
+    /// absorbing writes forever into a stalled send buffer.
+    fn spawn_server_writer(mut write_half: OwnedWriteHalf, mut rx: mpsc::Receiver<ServerWrite>) {
+        tokio::spawn(async move {
+            while let Some(job) = rx.recv().await {
+                let result = match tokio::time::timeout(
+                    SERVER_WRITE_TIMEOUT,
+                    write_half.write_all(&job.bytes),
+                )
+                .await
                 {
+                    Ok(result) => result,
+                    Err(_) => Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        SERVER_WRITE_STALLED,
+                    )),
+                };
+                let failed = result.is_err();
+                if let Some(ack) = job.ack {
+                    let _ = ack.send(result);
+                }
+                if failed {
+                    tracing::warn!("soulseek: server write failed; dropping writer");
                     break;
                 }
             }
+            // Dropping `rx` fails every queued caller at once instead of
+            // leaving them waiting on a socket that is gone.
         });
     }
 
@@ -567,7 +683,9 @@ impl NativeClient {
         });
     }
 
-    /// Start a server-side search, returning the token used to correlate results.
+    /// Start a server-side search, returning the token used to correlate
+    /// results. Fails rather than hanging when the server socket cannot take
+    /// the request (see [`SERVER_SEND_TIMEOUT`]).
     pub async fn start_search(&self, query: &str) -> Result<u32, crate::error::Error> {
         let token = next_token();
         let msg = FileSearch {
@@ -575,19 +693,18 @@ impl NativeClient {
             query: query.to_string(),
         }
         .encode();
-        let mut server = self.inner.server.lock().await;
-        server
-            .write_all(&msg.encode())
-            .await
-            .map_err(|e| crate::error::Error::Io(e.to_string()))?;
-        drop(server);
-
+        // Track the token before the request goes out so a fast peer response
+        // cannot arrive before we are listening for it.
         self.inner
             .shared
             .lock()
             .unwrap()
             .searches
             .insert(token, Vec::new());
+        if let Err(e) = self.inner.server_send(msg.encode()).await {
+            self.inner.shared.lock().unwrap().searches.remove(&token);
+            return Err(e);
+        }
         Ok(token)
     }
 
@@ -732,13 +849,7 @@ impl NativeClient {
             username: username.to_string(),
         }
         .encode();
-        {
-            let mut server = self.inner.server.lock().await;
-            server
-                .write_all(&msg.encode())
-                .await
-                .map_err(|e| crate::error::Error::Io(e.to_string()))?;
-        }
+        self.inner.server_send(msg.encode()).await?;
         match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
             Ok(Ok(info)) => Ok(info),
             Ok(Err(_)) | Err(_) => Err(crate::error::Error::Unavailable(
@@ -946,8 +1057,14 @@ async fn connect_peer(
             username: username.to_string(),
         }
         .encode();
-        let mut server = inner.server.lock().await;
-        server.write_all(&msg.encode()).await?;
+        if let Err(e) = inner.server_try_send(msg.encode()) {
+            // Release whatever was registered under us before failing.
+            let mut shared = inner.shared.lock().unwrap();
+            if let Some(v) = shared.pending_addr.get_mut(username) {
+                v.retain(|_| false);
+            }
+            return Err(std::io::Error::other(server_send_error(e).to_string()));
+        }
     }
     let addr = match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
         Ok(Ok(addr)) => addr,
@@ -3555,5 +3672,118 @@ mod tests {
         assert_eq!(folder.files[0].virtual_path, "music/album/t.mp3");
 
         server.stop().await;
+    }
+
+    /// A mock server that completes login, then holds the connection open
+    /// without reading anything until the test tells it to close.
+    async fn spawn_deaf_server() -> (SocketAddr, oneshot::Sender<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (close_tx, close_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(login) = read_message(&mut stream).await else {
+                return;
+            };
+            assert_eq!(login.code, code::LOGIN);
+            stream
+                .write_all(
+                    &crate::wire::LoginResponse::encode_success("hi", 0, "hash", false).encode(),
+                )
+                .await
+                .unwrap();
+            let _ = close_rx.await;
+            drop(stream);
+        });
+        (addr, close_tx)
+    }
+
+    async fn connect_to_deaf_server(addr: SocketAddr) -> NativeClient {
+        let listen_port = free_listen_port().await;
+        let tmp = std::env::temp_dir();
+        NativeClient::connect(NativeConfig {
+            server_addr: addr.to_string(),
+            username: "me".to_string(),
+            password: "pw".to_string(),
+            listen_port,
+            download_dir: tmp.to_string_lossy().into_owned(),
+            ..NativeConfig::default()
+        })
+        .await
+        .expect("connect")
+    }
+
+    /// Once the server connection is gone, socket writes must fail rather than
+    /// park the caller, so a search start still returns quickly.
+    #[tokio::test]
+    async fn dead_server_socket_does_not_park_search_start() {
+        let (addr, close) = spawn_deaf_server().await;
+        let client = connect_to_deaf_server(addr).await;
+
+        // Server side drops the socket; its peer learns the connection is dead.
+        let _ = close.send(());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let outcomes = tokio::time::timeout(Duration::from_secs(5), async {
+            let first = client.start_search("one").await;
+            let second = client.start_search("two").await;
+            let third = client.start_search("three").await;
+            (first, second, third)
+        })
+        .await
+        .expect("search start waited past its bound on a dead server socket");
+
+        assert!(
+            outcomes.0.is_err() || outcomes.1.is_err() || outcomes.2.is_err(),
+            "a dead server socket should surface as an error, got {:?}",
+            outcomes
+        );
+    }
+
+    /// Regression for the reported hang: one stalled server write (half-dead
+    /// connection, full send buffer) must not block a later search start. The
+    /// mock server logs in and then never reads again, so the client's send
+    /// buffer fills and the writer wedges mid-write. Ignored by default
+    /// because a real stall costs about `SERVER_SEND_TIMEOUT`; run it with
+    /// `cargo test --lib -- --ignored stalled_server_write`.
+    #[tokio::test]
+    #[ignore = "needs a real socket stall; run with --ignored"]
+    async fn stalled_server_write_is_bounded_and_search_start_still_returns() {
+        let (addr, close) = spawn_deaf_server().await;
+        let client = connect_to_deaf_server(addr).await;
+
+        // Wedge the writer: queue payloads until the queue refuses, which
+        // means the writer is stuck inside a socket write.
+        let chunk = vec![0u8; 64 * 1024];
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut wedged = false;
+        while std::time::Instant::now() < deadline {
+            if client.inner.server_try_send(chunk.clone()).is_err() {
+                wedged = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(wedged, "could not fill the server socket send buffer");
+
+        // The search start must come back inside its bound, erroring out
+        // rather than waiting on the wedged socket.
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            SERVER_SEND_TIMEOUT + Duration::from_secs(5),
+            client.start_search("flac"),
+        )
+        .await
+        .expect("start_search waited unboundedly on a stalled server socket");
+        let elapsed = started.elapsed();
+        println!("stalled start_search returned after {elapsed:?}: {outcome:?}");
+        assert!(
+            outcome.is_err(),
+            "expected the stalled socket to surface as an error, got {outcome:?}"
+        );
+
+        let _ = close.send(());
     }
 }
